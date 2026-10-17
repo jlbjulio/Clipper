@@ -47,6 +47,7 @@ $clips = Join-Path $work "clips"; $shots = Join-Path $work "shots"
 Remove-Item $clips, $shots -Recurse -Force -ErrorAction SilentlyContinue
 function WriteConfig($secs, $fps, $follow = 'true', $monitor = '') {
     @"
+record_desktop = true
 follow_focus = $follow
 monitor = $monitor
 clip_seconds = $secs

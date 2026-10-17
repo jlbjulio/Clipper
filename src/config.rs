@@ -115,6 +115,8 @@ pub struct Config {
     pub clip_secs: u32,
     pub fps: u32,
     pub quality: Quality,
+    /// Target bitrate in kbps, overriding `quality`; 0 uses the quality preset.
+    pub bitrate_kbps: u32,
     pub cursor: bool,
     pub system_audio: bool,
     pub mic: bool,
@@ -122,6 +124,8 @@ pub struct Config {
     pub system_device: String,
     /// Microphone by name; empty uses the Windows default.
     pub mic_device: String,
+    /// Record the desktop while no game is open; off records games only.
+    pub record_desktop: bool,
     /// Record the monitor holding the focused window; otherwise always `monitor`.
     pub follow_focus: bool,
     /// Device name (\\.\DISPLAY1) of the fixed or fallback monitor; empty means the primary one.
@@ -139,6 +143,8 @@ pub struct Config {
 
 pub const CLIP_LENGTHS: [u32; 5] = [15, 30, 60, 90, 120];
 pub const FRAME_RATES: [u32; 2] = [30, 60];
+/// Accepted custom bitrates in kbps.
+pub const BITRATES: std::ops::RangeInclusive<u32> = 1_000..=100_000;
 
 /// Videos\Captures, where Windows' own Game Bar saves clips and screenshots. The Videos folder
 /// comes from Windows, so it follows a library moved to OneDrive or another drive.
@@ -164,11 +170,13 @@ impl Default for Config {
             clip_secs: 30,
             fps: 60,
             quality: Quality::Medium,
+            bitrate_kbps: 0,
             cursor: true,
             system_audio: true,
             mic: true,
             system_device: String::new(),
             mic_device: String::new(),
+            record_desktop: false,
             follow_focus: true,
             monitor: String::new(),
             gpu: String::new(),
@@ -241,11 +249,19 @@ impl Config {
                         .find(|q| q.key() == value)
                         .unwrap_or(c.quality)
                 }
+                "bitrate_kbps" => {
+                    c.bitrate_kbps = value
+                        .parse()
+                        .ok()
+                        .filter(|v| *v == 0 || BITRATES.contains(v))
+                        .unwrap_or(c.bitrate_kbps)
+                }
                 "cursor" => c.cursor = flag().unwrap_or(c.cursor),
                 "system_audio" => c.system_audio = flag().unwrap_or(c.system_audio),
                 "microphone" => c.mic = flag().unwrap_or(c.mic),
                 "system_audio_device" => c.system_device = value.to_string(),
                 "microphone_device" => c.mic_device = value.to_string(),
+                "record_desktop" => c.record_desktop = flag().unwrap_or(c.record_desktop),
                 "follow_focus" => c.follow_focus = flag().unwrap_or(c.follow_focus),
                 "monitor" => c.monitor = value.to_string(),
                 "gpu" => c.gpu = value.to_string(),
@@ -265,20 +281,22 @@ impl Config {
     pub fn to_text(&self) -> String {
         format!(
             "# Clipper settings. Edit here or from the tray icon > Settings.\n\
-             clip_seconds = {}\nfps = {}\nquality = {}\ncursor = {}\n\
+             clip_seconds = {}\nfps = {}\nquality = {}\nbitrate_kbps = {}\ncursor = {}\n\
              system_audio = {}\nmicrophone = {}\nsystem_audio_device = {}\nmicrophone_device = {}\n\
-             follow_focus = {}\nmonitor = {}\ngpu = {}\n\
+             record_desktop = {}\nfollow_focus = {}\nmonitor = {}\ngpu = {}\n\
              clip_hotkey = {}\nscreenshot_hotkey = {}\npause_hotkey = {}\n\
              clips_folder = {}\nscreenshots_folder = {}\n\
              notifications = {}\nstart_with_windows = {}\n",
             self.clip_secs,
             self.fps,
             self.quality.key(),
+            self.bitrate_kbps,
             self.cursor,
             self.system_audio,
             self.mic,
             self.system_device,
             self.mic_device,
+            self.record_desktop,
             self.follow_focus,
             self.monitor,
             self.gpu,
@@ -311,12 +329,14 @@ mod tests {
             clip_secs: 90,
             fps: 30,
             quality: Quality::High,
+            bitrate_kbps: 16_000,
             cursor: false,
             system_audio: false,
             mic: false,
             system_device: "SteelSeries Sonar - Gaming (SteelSeries Sonar Virtual Audio Device)"
                 .into(),
             mic_device: "Microphone (Blue Snowball)".into(),
+            record_desktop: true,
             follow_focus: false,
             monitor: r"\\.\DISPLAY2".into(),
             gpu: "NVIDIA GeForce RTX 3050 Laptop GPU".into(),
@@ -340,7 +360,8 @@ mod tests {
     #[test]
     fn bad_values_fall_back_to_defaults() {
         let c = Config::parse(
-            "fps = 75\nclip_seconds = -3\nquality = ultra\nclip_hotkey = Alt+Banana\ncursor = maybe",
+            "fps = 75\nclip_seconds = -3\nquality = ultra\nclip_hotkey = Alt+Banana\ncursor = maybe\n\
+             bitrate_kbps = 50\nrecord_desktop = sometimes",
         );
         assert_eq!(c, Config::default());
     }

@@ -19,6 +19,9 @@ const SEG_SECS: i64 = 10;
 /// `TimeSpan` units (100 ns) per second.
 pub const TICKS: i64 = 10_000_000;
 
+/// The error a clip request gets when there is no recorded history to cut it from.
+pub const NOTHING_RECORDED: &str = "nothing recorded yet";
+
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -26,6 +29,8 @@ pub struct Params {
     pub clip_secs: u32,
     pub fps: u32,
     pub quality: Quality,
+    /// Overrides `quality` when non-zero.
+    pub bitrate_kbps: u32,
 }
 
 /// What happened to a requested clip, reported back to the tray.
@@ -87,11 +92,14 @@ pub struct Recorder {
     // Built shortly before a rotation so switching segments never stalls the capture thread.
     spare: Mutex<Option<Built>>,
     refilling: AtomicBool,
+    /// Off between `stop` and `run`: a frame still in flight from a closed capture session must
+    /// not start a new segment.
+    running: AtomicBool,
     jobs: Sender<Job>,
 }
 
 impl Recorder {
-    /// Encoding starts with the first `set_size`, once the captured monitor's resolution is known.
+    /// Encoding starts with the first frame, once the size of the captured picture is known.
     pub fn new(
         gpu: Arc<Gpu>,
         dir: PathBuf,
@@ -112,6 +120,7 @@ impl Recorder {
             active: Mutex::new(None),
             spare: Mutex::new(None),
             refilling: AtomicBool::new(false),
+            running: AtomicBool::new(false),
             jobs,
         })
     }
@@ -128,8 +137,14 @@ impl Recorder {
             // CPU encoding: keep it light enough to leave the game its processor.
             p.fps = p.fps.min(30);
             p.quality = Quality::Low;
+            p.bitrate_kbps = 0;
         }
-        let enc = Encoder::new(&gpu, &path, w, h, p.fps, p.quality.bitrate(w, h, p.fps))?;
+        let bitrate = if p.bitrate_kbps > 0 {
+            p.bitrate_kbps * 1000
+        } else {
+            p.quality.bitrate(w, h, p.fps)
+        };
+        let enc = Encoder::new(&gpu, &path, w, h, p.fps, bitrate)?;
         Ok((gpu, enc, path, TICKS / p.fps as i64))
     }
 
@@ -171,15 +186,22 @@ impl Recorder {
         self.finish(old);
     }
 
-    /// Stops encoding (pause); the recorded history stays available for a clip.
+    /// Accepts frames again; the next one starts a segment.
+    pub fn run(&self) {
+        self.running.store(true, Ordering::Release);
+    }
+
+    /// Stops encoding (pause, or nothing to record); the recorded history stays available for
+    /// a clip.
     pub fn stop(&self) {
+        self.running.store(false, Ordering::Release);
         drop(self.spare.lock().unwrap().take());
         let old = self.active.lock().unwrap().take();
         self.finish(old);
     }
 
-    /// Matches the encoder to the captured monitor and starts encoding if it was stopped.
-    pub fn set_size(self: &Arc<Self>, size: (u32, u32)) {
+    /// Matches the encoder to the captured picture and starts encoding if it was stopped.
+    fn set_size(self: &Arc<Self>, size: (u32, u32)) {
         let changed = std::mem::replace(&mut *self.size.lock().unwrap(), size) != size;
         if changed || self.active.lock().unwrap().is_none() {
             // A clip never spans two sizes: mp4::join keeps the run that covers most of it.
@@ -218,7 +240,15 @@ impl Recorder {
         let _ = self.jobs.send(Job::Save { end, out });
     }
 
-    pub fn on_frame(self: &Arc<Self>, tex: &ID3D11Texture2D, ts: i64) {
+    /// Encodes the `size` picture in the top-left corner of `tex`. The first frame, or one of
+    /// another size (a resized window), starts a segment with an encoder of that size.
+    pub fn on_frame(self: &Arc<Self>, tex: &ID3D11Texture2D, ts: i64, size: (u32, u32)) {
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
+        if *self.size.lock().unwrap() != size || self.active.lock().unwrap().is_none() {
+            self.set_size(size);
+        }
         let mut guard = self.active.lock().unwrap();
         let age = guard.as_ref().and_then(|a| a.first).map_or(0, |f| ts - f);
         if age >= (SEG_SECS - 2) * TICKS {
@@ -313,7 +343,7 @@ fn finisher(rx: Receiver<Job>, clip_secs: &AtomicU64, on_saved: impl Fn(Outcome)
                     })
                     .collect();
                 let result = if sources.is_empty() {
-                    Err("nothing recorded yet".to_string())
+                    Err(NOTHING_RECORDED.to_string())
                 } else {
                     let _ = out.parent().map(fs::create_dir_all);
                     mp4::join(&sources, from, &out)

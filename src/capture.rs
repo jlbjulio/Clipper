@@ -11,7 +11,7 @@ use windows::Graphics::Capture::{
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::GENERIC_WRITE;
-use windows::Win32::Foundation::{LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -225,7 +225,16 @@ impl Gpu {
     }
 }
 
-/// A live capture of one monitor. Dropping it stops the capture.
+/// What a capture session records.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    Monitor(HMONITOR),
+    /// A game's window: recorded even while other windows cover it, as long as it is not
+    /// minimized.
+    Window(HWND),
+}
+
+/// A live capture of a monitor or a window. Dropping it stops the capture.
 pub struct Session {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
@@ -233,8 +242,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// True once this session no longer matches the monitor: Windows ended it (unplugged,
-    /// sleep) or the resolution changed, as when a game switches the display mode.
+    /// True once this session no longer matches its source: Windows ended it (window closed,
+    /// monitor unplugged, sleep) or the size changed, as when a game switches the display mode
+    /// or its window is resized.
     pub fn is_stale(&self) -> bool {
         self.stale.load(Ordering::Acquire)
     }
@@ -247,10 +257,13 @@ impl Drop for Session {
     }
 }
 
-fn item(monitor: HMONITOR) -> Result<GraphicsCaptureItem> {
+fn item(source: Source) -> Result<GraphicsCaptureItem> {
+    let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     unsafe {
-        windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?
-            .CreateForMonitor(monitor)
+        match source {
+            Source::Monitor(m) => interop.CreateForMonitor(m),
+            Source::Window(w) => interop.CreateForWindow(w),
+        }
     }
 }
 
@@ -295,7 +308,7 @@ pub fn monitors() -> Vec<MonitorInfo> {
                 handle: m.0 as usize,
                 device: String::from_utf16_lossy(&info.szDevice[..len]),
                 primary: info.monitorInfo.dwFlags & 1 != 0,
-                size: monitor_size(m).unwrap_or_default(),
+                size: source_size(Source::Monitor(m)).unwrap_or_default(),
             })
         })
         .collect();
@@ -316,22 +329,27 @@ pub fn monitor_pixels(monitor: HMONITOR) -> Option<(u32, u32)> {
     Some(((r.right - r.left) as u32, (r.bottom - r.top) as u32))
 }
 
-/// The monitor's resolution in physical pixels, as capture will deliver it.
-pub fn monitor_size(monitor: HMONITOR) -> Result<(u32, u32)> {
-    let size = item(monitor)?.Size()?;
+/// The source's size in physical pixels, as capture will deliver it.
+pub fn source_size(source: Source) -> Result<(u32, u32)> {
+    let size = item(source)?.Size()?;
     Ok((size.Width as u32, size.Height as u32))
 }
 
-/// Starts capturing `monitor`; `on_frame` gets each new frame and its QPC timestamp (100 ns units).
-/// The current image arrives right away; after that, frames only come when the screen changes.
+/// Starts capturing `source`; `on_frame` gets each new frame, its QPC timestamp (100 ns units)
+/// and the size of the picture in it. The current image arrives right away; after that, frames
+/// only come on changes.
+///
+/// The picture sits in the frame's top-left corner and can be smaller than the frame: a window's
+/// capture item counts its invisible resize borders, the delivered content does not. Its size is
+/// rounded down to even numbers, as H.264 needs.
 pub fn start(
     gpu: &Gpu,
-    monitor: HMONITOR,
+    source: Source,
     cursor: bool,
     fps: Option<u32>,
-    on_frame: impl Fn(&ID3D11Texture2D, i64) + Send + 'static,
+    on_frame: impl Fn(&ID3D11Texture2D, i64, (u32, u32)) + Send + 'static,
 ) -> Result<Session> {
-    let item = item(monitor)?;
+    let item = item(source)?;
     let size = item.Size()?;
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &gpu.winrt,
@@ -359,10 +377,15 @@ pub fn start(
     pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, _>::new(
         move |pool, _| {
             let frame = pool.ok()?.TryGetNextFrame()?;
-            if frame.ContentSize()? != size {
-                // The display mode changed: these frames no longer fit the pool or the
-                // encoder. Drop them until the session is rebuilt at the new size.
+            let content = frame.ContentSize()?;
+            if content.Width > size.Width || content.Height > size.Height {
+                // The display mode changed or the window grew: the picture no longer fits the
+                // pool. Drop frames until the session is rebuilt at the new size.
                 flag.store(true, Ordering::Release);
+                return Ok(());
+            }
+            let picture = (content.Width as u32 & !1, content.Height as u32 & !1);
+            if picture.0 == 0 || picture.1 == 0 {
                 return Ok(());
             }
             let ts = frame.SystemRelativeTime()?.Duration;
@@ -372,7 +395,7 @@ pub fn start(
                     .cast::<IDirect3DDxgiInterfaceAccess>()?
                     .GetInterface()?
             };
-            on_frame(&tex, ts);
+            on_frame(&tex, ts, picture);
             Ok(())
         },
     ))?;
@@ -393,11 +416,17 @@ pub fn screenshot(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::sync_channel::<ID3D11Texture2D>(1);
     let tx = std::sync::Mutex::new(Some(tx));
-    let _session = start(gpu, monitor, false, None, move |tex, _| {
-        if let Some(tx) = tx.lock().unwrap().take() {
-            let _ = tx.send(tex.clone());
-        }
-    })?;
+    let _session = start(
+        gpu,
+        Source::Monitor(monitor),
+        false,
+        None,
+        move |tex, _, _| {
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(tex.clone());
+            }
+        },
+    )?;
     let tex = rx.recv_timeout(Duration::from_secs(2))?;
     let (pixels, w, h) = read_back(gpu, &tex)?;
     write_png(path, &pixels, w, h)?;

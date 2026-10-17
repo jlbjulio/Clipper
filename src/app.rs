@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs, thread};
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
@@ -23,11 +24,14 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GUI_INMOVESIZE, GUITHREADINFO, GetClassNameW, GetCursorPos,
-    GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, KillTimer, MSG,
-    SW_SHOWNORMAL, SetTimer, TranslateMessage, WM_CONTEXTMENU, WM_HOTKEY, WM_TIMER, WM_USER,
+    GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, IsWindow,
+    KillTimer, MSG, SW_SHOWNORMAL, SetTimer, TranslateMessage, WM_CONTEXTMENU, WM_HOTKEY, WM_TIMER,
+    WM_USER,
 };
 
+use crate::capture::Source;
 use crate::config::{Config, Hotkey};
+use crate::games::Games;
 use crate::overlay::Overlay;
 use crate::recorder::{Outcome, Params, Recorder};
 use crate::text::t;
@@ -124,6 +128,7 @@ fn params(c: &Config) -> Params {
         clip_secs: c.clip_secs,
         fps: c.fps,
         quality: c.quality,
+        bitrate_kbps: c.bitrate_kbps,
     }
 }
 
@@ -205,6 +210,15 @@ fn fallback_monitor(cfg: &Config) -> usize {
         )
 }
 
+/// What the clips record. Handles are kept as addresses so the value is plain data.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    /// No game is open and desktop recording is off: nothing is captured or encoded.
+    Idle,
+    Monitor(usize),
+    Window(usize),
+}
+
 struct App {
     cfg: Config,
     tray: Tray,
@@ -212,9 +226,16 @@ struct App {
     rec: Arc<Recorder>,
     mixer: audio::Mixer,
     session: Option<capture::Session>,
+    /// What is being recorded, and the game's name when it is a game.
+    target: Target,
+    game: String,
+    /// The monitor of the last desktop recording; screenshots follow the focus on their own.
     monitor: usize,
     fallback: usize,
-    candidate: (usize, u8),
+    candidate: (Target, u8),
+    games: Games,
+    /// Ticks to wait before retrying a capture that failed to start.
+    retry: u8,
     paused: bool,
     keys_on: bool,
     overlay: Overlay,
@@ -268,27 +289,84 @@ impl App {
         }
     }
 
+    /// What to record now: a visible game first; else the desktop, when that is on; else
+    /// nothing. Also returns the game's name.
+    fn want(&mut self) -> (Target, String) {
+        let current = match self.target {
+            Target::Window(h) => Some(h),
+            _ => None,
+        };
+        if let Some(g) = self.games.find(current) {
+            return (Target::Window(g.hwnd), g.name);
+        }
+        if !self.cfg.record_desktop {
+            return (Target::Idle, String::new());
+        }
+        // The process lookup in hold_focus only runs when the focus is on another monitor.
+        let m = match target_monitor(&self.cfg, self.fallback) {
+            m if Target::Monitor(m) != self.target && hold_focus() => match self.target {
+                Target::Monitor(current) => current,
+                _ => m,
+            },
+            m => m,
+        };
+        (Target::Monitor(m), String::new())
+    }
+
+    fn switch(&mut self, target: Target, game: String) {
+        if target != self.target {
+            match target {
+                Target::Idle => log("no game open; waiting"),
+                Target::Monitor(_) => log("recording the desktop"),
+                Target::Window(_) => log(&format!("recording the game: {game}")),
+            }
+        }
+        self.target = target;
+        self.game = game;
+        if let Target::Monitor(m) = target {
+            self.monitor = m;
+        }
+        self.begin();
+    }
+
+    /// (Re)starts capture of the current target. With nothing to record, encoding stops too:
+    /// the recorded history stays for a clip, and no segment grows on silence.
     fn begin(&mut self) {
         drop(self.session.take());
-        let hmon = HMONITOR(self.monitor as _);
-        self.mode = capture::monitor_pixels(hmon);
+        let source = match self.target {
+            Target::Idle => {
+                self.rec.stop();
+                self.publish();
+                return;
+            }
+            Target::Monitor(m) => {
+                let hmon = HMONITOR(m as _);
+                self.mode = capture::monitor_pixels(hmon);
+                Source::Monitor(hmon)
+            }
+            Target::Window(h) => Source::Window(HWND(h as _)),
+        };
         self.pick_gpu();
-        // The encoder has to exist before the session starts: on a static screen the session's
-        // first frame may be the only one for a long time.
-        let started = capture::monitor_size(hmon).and_then(|size| {
-            self.rec.set_size(size);
-            let sink = self.rec.clone();
-            capture::start(
-                &self.gpu,
-                hmon,
-                self.cfg.cursor,
-                Some(self.effective_fps()),
-                move |tex, ts| sink.on_frame(tex, ts),
-            )
-        });
+        // The recorder sizes its encoder from the first frame, which on a static screen may be
+        // the only one for a long time, so that frame is always encoded.
+        self.rec.run();
+        let sink = self.rec.clone();
+        let started = capture::start(
+            &self.gpu,
+            source,
+            self.cfg.cursor,
+            Some(self.effective_fps()),
+            move |tex, ts, size| sink.on_frame(tex, ts, size),
+        );
         match started {
-            Ok(s) => self.session = Some(s),
-            Err(e) => log(&format!("capture failed to start: {e}")),
+            Ok(s) => {
+                self.session = Some(s);
+                self.retry = 0;
+            }
+            Err(e) => {
+                log(&format!("capture failed to start: {e}"));
+                self.retry = 10;
+            }
         }
         self.publish();
     }
@@ -319,21 +397,32 @@ impl App {
     /// Updates the tray icon and the status line the settings window shows.
     fn publish(&mut self) {
         let recording = !self.paused && self.session.is_some();
-        let device = capture::monitors()
-            .into_iter()
-            .find(|m| m.handle == self.monitor)
-            .map(|m| m.device)
-            .unwrap_or_default();
-        let tip = if recording {
-            format!("Clipper · {} · {} s", t().recording, self.cfg.clip_secs)
+        let device = match self.target {
+            Target::Monitor(m) => capture::monitors()
+                .into_iter()
+                .find(|i| i.handle == m)
+                .map(|i| i.device)
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let game = match self.target {
+            // The status line is `key=value;` pairs.
+            Target::Window(_) => self.game.replace([';', '='], " "),
+            _ => String::new(),
+        };
+        let (state, tip) = if self.paused {
+            ("paused", format!("Clipper · {}", t().paused))
+        } else if recording {
+            (
+                "recording",
+                format!("Clipper · {} · {} s", t().recording, self.cfg.clip_secs),
+            )
         } else {
-            format!("Clipper · {}", t().paused)
+            ("waiting", format!("Clipper · {}", t().status_waiting))
         };
         self.tray.set_state(recording, &tip);
         self.tray.set_status(&format!(
-            "state={};monitor={};gpu={}",
-            if recording { "recording" } else { "paused" },
-            device,
+            "state={state};monitor={device};game={game};gpu={}",
             self.gpu.name,
         ));
     }
@@ -361,17 +450,16 @@ impl App {
             self.register_keys();
         }
         self.fallback = fallback_monitor(&self.cfg);
-        let monitor = target_monitor(&self.cfg, self.fallback);
+        let (target, game) = self.want();
         // New parameters start a new segment, which needs a fresh session to get its first frame.
         if !self.paused
             && (params_changed
                 || old.cursor != self.cfg.cursor
                 || old.gpu != self.cfg.gpu
-                || monitor != self.monitor
-                || self.session.is_none())
+                || target != self.target
+                || (self.session.is_none() && target != Target::Idle))
         {
-            self.monitor = monitor;
-            self.begin();
+            self.switch(target, game);
         }
         self.publish();
     }
@@ -379,7 +467,7 @@ impl App {
     fn save_clip(&mut self) {
         let name = format!("Clip {}.mp4", stamp());
         self.rec.save(now_ticks(), self.cfg.clips_dir.join(name));
-        if !self.paused {
+        if !self.paused && self.target != Target::Idle {
             // A fresh session hands the new segment the current image even if nothing moves.
             self.begin();
         }
@@ -411,8 +499,8 @@ impl App {
             self.rec.stop();
             log("recording paused");
         } else {
-            self.monitor = target_monitor(&self.cfg, self.fallback);
-            self.begin();
+            let (target, game) = self.want();
+            self.switch(target, game);
             log("recording resumed");
         }
         self.publish();
@@ -445,7 +533,16 @@ impl App {
                 }
             }
             Err(e) => {
-                // Failures always show, even with notifications off.
+                // Failures always show, even with notifications off. An empty history while
+                // games-only recording waits means no game was open.
+                let e = if e == crate::recorder::NOTHING_RECORDED
+                    && self.target == Target::Idle
+                    && !self.cfg.record_desktop
+                {
+                    t().no_game.to_string()
+                } else {
+                    e
+                };
                 self.overlay.show(monitor, fail_title, &e);
                 unsafe { SetTimer(self.tray.hwnd, OVERLAY_TIMER, 30, None) };
             }
@@ -499,34 +596,40 @@ impl App {
         if self.paused {
             return;
         }
-        // Follow the focused window to another monitor once it has stayed there for ~1 s.
-        // The process lookup in hold_focus only runs when the focus is on another monitor.
-        let m = match target_monitor(&self.cfg, self.fallback) {
-            m if m != self.monitor && hold_focus() => self.monitor,
-            m => m,
-        };
-        self.candidate = if m == self.candidate.0 {
-            (m, self.candidate.1.saturating_add(1))
+        // A new target must hold for two ticks (~1 s): a quick Alt+Tab or a glance at another
+        // monitor does not restart capture.
+        let (want, game) = self.want();
+        self.candidate = if want == self.candidate.0 {
+            (want, self.candidate.1.saturating_add(1))
         } else {
-            (m, 1)
+            (want, 1)
         };
-        let moved = m != self.monitor && self.candidate.1 >= 2;
-        // Windows ends a session on display changes (resolution, unplugging, sleep).
-        // A game switching the display mode is compared against the mode the session started in.
-        let mode = capture::monitor_pixels(HMONITOR(self.monitor as _));
-        let dead = self.session.as_ref().is_none_or(|s| s.is_stale()) || mode != self.mode;
-        if moved || dead {
-            if moved {
-                log("following focus to another monitor");
-            } else {
+        let settled = want != self.target && self.candidate.1 >= 2;
+        // Windows ends a session when its window closes or its monitor changes (resolution,
+        // unplugging, sleep). A game switching the display mode is compared against the mode
+        // the session started in.
+        let dead = match self.target {
+            Target::Idle => false,
+            Target::Monitor(m) => {
+                self.session.as_ref().is_none_or(|s| s.is_stale())
+                    || capture::monitor_pixels(HMONITOR(m as _)) != self.mode
+            }
+            Target::Window(h) => {
+                self.session.as_ref().is_none_or(|s| s.is_stale())
+                    || unsafe { IsWindow(h as _) } == 0
+            }
+        };
+        // A capture that failed to start is retried every few seconds, not on every tick.
+        if self.session.is_none() && self.retry > 0 && !settled {
+            self.retry -= 1;
+            return;
+        }
+        if settled || dead {
+            if dead && matches!(self.target, Target::Monitor(_)) {
                 self.fallback = fallback_monitor(&self.cfg);
             }
-            self.monitor = if moved {
-                m
-            } else {
-                target_monitor(&self.cfg, self.fallback)
-            };
-            self.begin();
+            let (target, game) = if settled { (want, game) } else { self.want() };
+            self.switch(target, game);
         }
     }
 }
@@ -609,6 +712,7 @@ pub fn run() {
 
     let fallback = fallback_monitor(&cfg);
     let monitor = target_monitor(&cfg, fallback);
+    let games = Games::new();
     let mut app = App {
         cfg,
         tray,
@@ -616,9 +720,13 @@ pub fn run() {
         rec,
         mixer,
         session: None,
+        target: Target::Idle,
+        game: String::new(),
         monitor,
         fallback,
-        candidate: (monitor, 0),
+        candidate: (Target::Idle, 0),
+        games,
+        retry: 0,
         paused: false,
         keys_on: true,
         overlay: Overlay::new(),
@@ -628,7 +736,12 @@ pub fn run() {
     set_autostart(app.cfg.autostart);
     hotkeys::start(app.tray.hwnd as usize);
     app.register_keys();
-    app.begin();
+    let (target, game) = app.want();
+    if target == Target::Idle {
+        // switch() only logs changes, and the app starts out idle.
+        log("no game open; waiting");
+    }
+    app.switch(target, game);
     log(&format!(
         "Clipper running; clip {}, screenshot {}",
         app.cfg.clip_key.label(),

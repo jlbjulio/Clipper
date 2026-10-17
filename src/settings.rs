@@ -97,7 +97,10 @@ struct Accent {
 /// What the running tray process reports about itself.
 struct Status {
     recording: bool,
+    /// Games-only recording with no game open.
+    waiting: bool,
     monitor: String,
+    game: String,
     gpu: String,
 }
 
@@ -121,7 +124,9 @@ fn read_status() -> Option<Status> {
     };
     Some(Status {
         recording: field("state") == "recording",
+        waiting: field("state") == "waiting",
         monitor: field("monitor"),
+        game: field("game"),
         gpu: field("gpu"),
     })
 }
@@ -538,18 +543,23 @@ impl Settings {
                             },
                         );
                         let text = if s.recording {
-                            let monitor = self
-                                .monitors
-                                .iter()
-                                .position(|m| m.device == s.monitor)
-                                .map(|i| format!(" · Monitor {}", i + 1))
-                                .unwrap_or_default();
+                            let what = if !s.game.is_empty() {
+                                format!(" · {}", s.game)
+                            } else {
+                                self.monitors
+                                    .iter()
+                                    .position(|m| m.device == s.monitor)
+                                    .map(|i| format!(" · Monitor {}", i + 1))
+                                    .unwrap_or_default()
+                            };
                             let secs = self.saved.clip_secs.to_string();
                             format!(
-                                "{}{monitor} · {}",
+                                "{}{what} · {}",
                                 tx.status_recording.replace("{secs}", &secs),
                                 s.gpu
                             )
+                        } else if s.waiting {
+                            tx.status_waiting.to_string()
                         } else {
                             tx.status_paused.to_string()
                         };
@@ -588,18 +598,58 @@ impl Settings {
                 segmented(ui, &mut self.edit.fps, &fps, p)
             });
             let (w, h) = self.monitors.first().map_or((1920, 1080), |m| m.size);
-            let mb = self.edit.quality.bitrate(w, h, self.edit.fps) as f64
-                * self.edit.clip_secs as f64
-                / 8e6;
+            let preset = |q: Quality, fps: u32| q.bitrate(w, h, fps);
+            let bitrate = if self.edit.bitrate_kbps > 0 {
+                self.edit.bitrate_kbps * 1000
+            } else {
+                preset(self.edit.quality, self.edit.fps)
+            };
+            let mb = bitrate as f64 * self.edit.clip_secs as f64 / 8e6;
             let estimate = tx.disk_estimate.replace("{mb}", &format!("{mb:.0}"));
+            // The three presets, then Custom: a bitrate of the user's own.
+            const CUSTOM: usize = 3;
+            let mut choice = if self.edit.bitrate_kbps > 0 {
+                CUSTOM
+            } else {
+                Quality::ALL
+                    .iter()
+                    .position(|q| *q == self.edit.quality)
+                    .unwrap_or(1)
+            };
             let q = [
-                (Quality::Low, tx.q_low.to_string()),
-                (Quality::Medium, tx.q_medium.to_string()),
-                (Quality::High, tx.q_high.to_string()),
+                (0, tx.q_low.to_string()),
+                (1, tx.q_medium.to_string()),
+                (2, tx.q_high.to_string()),
+                (CUSTOM, tx.q_custom.to_string()),
             ];
             row(ui, tx.quality, Some(&estimate), p, false, |ui| {
-                segmented(ui, &mut self.edit.quality, &q, p)
+                segmented(ui, &mut choice, &q, p)
             });
+            match choice {
+                // Custom starts from what the current preset uses, rounded to 500 kbps.
+                CUSTOM if self.edit.bitrate_kbps == 0 => {
+                    let kbps = preset(self.edit.quality, self.edit.fps) / 1000;
+                    self.edit.bitrate_kbps = ((kbps + 250) / 500 * 500).clamp(
+                        *crate::config::BITRATES.start(),
+                        *crate::config::BITRATES.end(),
+                    );
+                }
+                CUSTOM => {}
+                i => {
+                    self.edit.quality = Quality::ALL[i];
+                    self.edit.bitrate_kbps = 0;
+                }
+            }
+            if self.edit.bitrate_kbps > 0 {
+                row(ui, tx.bitrate, None, p, false, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.edit.bitrate_kbps)
+                            .range(crate::config::BITRATES)
+                            .speed(100.0)
+                            .suffix(" kbps"),
+                    );
+                });
+            }
             row(ui, tx.show_cursor, None, p, false, |ui| {
                 switch(ui, &mut self.edit.cursor, p)
             });
@@ -674,7 +724,10 @@ impl Settings {
         });
 
         card(ui, tx.sec_capture, p, |ui| {
-            row(ui, tx.follow_focus, None, p, true, |ui| {
+            row(ui, tx.record_desktop, None, p, true, |ui| {
+                switch(ui, &mut self.edit.record_desktop, p)
+            });
+            row(ui, tx.follow_focus, None, p, false, |ui| {
                 switch(ui, &mut self.edit.follow_focus, p)
             });
             let current = self

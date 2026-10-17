@@ -2,18 +2,21 @@
 
 # Clipper
 
-Clipper keeps the last 30 seconds of your screen and sound, and saves them as an MP4 when you press **Alt+G**. **Alt+F1** takes a screenshot. It sits next to the clock and stays out of your way: about 40 to 50 MB of memory in Task Manager and under 1% CPU while it records.
+Clipper keeps the last 30 seconds of your game and its sound, and saves them as an MP4 when you press **Alt+G**. **Alt+F1** takes a screenshot. It sits next to the clock and stays out of your way: about 40 to 50 MB of memory in Task Manager and under 1% CPU while it records.
 
 It is a small replacement for the Xbox Game Bar's "record what happened": one 4 MB program, no account, no overlay, no background services.
 
 ## What you get
 
+- **Records your games, not your desktop.** Clipper finds the games installed from Steam, Epic, Riot, GOG, Ubisoft, EA and the Xbox app, plus every game Windows itself has recognized, and records the game's own window. Switch to a browser or Discord with Alt+Tab and the clip still shows the game. With no game open, nothing is recorded and the GPU stays idle.
+- **Desktop recording when you want it.** Turn it on in settings and Clipper records the screen whenever no game is open, then goes back to the game when one starts.
 - **Save the last 15 to 120 seconds** with one shortcut, whenever something worth keeping just happened. Clips go to `Videos\Captures`, the same folder Windows uses.
-- **Screenshots** of the monitor you are using, saved as PNG next to your clips.
+- **Screenshots** of whatever the monitor you are using shows, saved as PNG next to your clips.
 - **Works over full-screen games.** Clips and screenshots capture borderless and exclusive full-screen games, and a game that changes the screen resolution keeps its picture in the clip.
 - **A quiet confirmation.** A small card shows "Clip saved" in the corner for two seconds. The mouse goes straight through it and the game keeps focus.
 - **Game sound and your microphone** in one track, in sync with the picture. Pick any output and input in settings, or leave both on the Windows default and Clipper follows it.
-- **Records the monitor you are using.** With several monitors, Clipper follows the focused window to the screen it is on.
+- **Follows you across monitors.** Screenshots and desktop recording use the screen that holds the focused window.
+- **Your choice of quality:** three presets, or a bitrate of your own in kbps. The bitrate is a target, not a fixed rate: busy scenes use it, still ones use far less.
 - **Light on laptops with two graphics chips.** Clipper records with the power-saving GPU, so a dedicated card can stay asleep on the desktop.
 - **Runs on any Windows PC.** It uses the GPU's video encoder when there is one, and falls back to software encoding at 30 fps when there is not.
 - **Clips play everywhere:** H.264 and AAC in a standard MP4, ready for Discord, browsers and phones.
@@ -42,7 +45,7 @@ Change them in settings: click a shortcut and press the new keys. If another app
 
 <p align="center"><img src="docs/settings.png" alt="Clipper settings window" width="560">&nbsp;&nbsp;<img src="docs/menu.png" alt="Tray menu" width="312"></p>
 
-Clip length, frame rate (30 or 60 fps), quality, shortcuts, audio devices, which monitor to record when no window has focus, and where files go. Changes apply as soon as you save, without restarting. Settings run in a separate window process that exits when you close it.
+Clip length, frame rate (30 or 60 fps), quality or a custom bitrate, shortcuts, audio devices, desktop recording, which monitor to use when no window has focus, and where files go. Changes apply as soon as you save, without restarting. Settings run in a separate window process that exits when you close it.
 
 ## Where things go
 
@@ -74,7 +77,8 @@ The video encoder is a separate part of the GPU from the one games draw with. At
 
 ## How it works
 
-- **Capture:** Windows.Graphics.Capture on a Direct3D 11 device, so frames stay on the GPU.
+- **Finding games:** the install folders of Steam (every library), Epic, Riot, GOG, Ubisoft, EA and the Xbox app, read again every minute, plus the list of games Windows keeps for the Game Bar. A program that fills its whole monitor while in front also counts. Launchers, browsers and chat apps never do. Nothing is injected into the game.
+- **Capture:** Windows.Graphics.Capture of the game's window (or a monitor for desktop recording) on a Direct3D 11 device, so frames stay on the GPU.
 - **Encoding:** the GPU's H.264 encoder through Media Foundation, or NVIDIA's NVENC directly on NVIDIA cards. Variable bitrate, a keyframe every second, low-latency mode. Audio is AAC.
 - **Audio:** WASAPI loopback and microphone capture through [cpal](https://github.com/RustAudio/cpal), resampled to 48 kHz and mixed on the same clock as the video frames.
 - **Replay buffer:** short MP4 segments on disk, so memory does not grow with clip length.

@@ -82,8 +82,9 @@ fn audio_type(subtype: &windows::core::GUID, bytes_per_sec: u32) -> Result<IMFMe
 
 /// Encoder settings handed over while the sink writer configures the encoder; vendor encoders
 /// ignore rate control changed afterwards. Variable bitrate keeps static scenes tiny, and a
-/// keyframe every second keeps clip cuts precise. The fastest preset keeps the GPU's video
-/// engine mostly idle while it records nonstop; the bitrate, not the preset, sets the quality.
+/// keyframe every second keeps clip cuts precise. The speed preset and low-latency mode keep
+/// the GPU's video engine light while it records nonstop: about 15% instead of 40% at 1080p60
+/// on an AMD Radeon 680M, mostly from low latency (that encoder already defaulted to speed).
 fn encoding_params(fps: u32, bitrate: u32) -> Result<IMFAttributes> {
     let a = attrs(6)?;
     unsafe {

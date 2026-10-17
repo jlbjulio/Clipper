@@ -5,6 +5,7 @@ mod audio;
 mod capture;
 mod config;
 mod encoder;
+mod games;
 mod hotkeys;
 mod mp4;
 mod nvenc;
