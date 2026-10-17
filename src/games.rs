@@ -32,7 +32,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::tray::wide;
 
-/// Programs Windows sometimes lists as games, or that go full screen, but are not games.
+/// Programs Windows sometimes lists as games, that sit in a game library, or that go full
+/// screen (video, slides, calls), but are not games.
 const NOT_GAMES: &[&str] = &[
     "applicationframehost.exe",
     "battle.net.exe",
@@ -49,18 +50,34 @@ const NOT_GAMES: &[&str] = &[
     "leagueclient.exe",
     "leagueclientux.exe",
     "leagueclientuxrender.exe",
+    "microsoft.media.player.exe",
+    "mpc-be64.exe",
+    "mpc-hc.exe",
+    "mpc-hc64.exe",
+    "ms-teams.exe",
     "msedge.exe",
+    "msedgewebview2.exe",
     "mpv.exe",
     "obs64.exe",
     "opera.exe",
+    "potplayermini.exe",
+    "potplayermini64.exe",
+    "powerpnt.exe",
     "riotclientservices.exe",
     "riotclientux.exe",
     "riotclientuxrender.exe",
     "robloxstudiobeta.exe",
+    "spotify.exe",
     "steam.exe",
     "steamwebhelper.exe",
+    "teams.exe",
     "ubisoftconnect.exe",
+    "ui32.exe",
     "vlc.exe",
+    "wallpaper32.exe",
+    "wallpaper64.exe",
+    "wmplayer.exe",
+    "zoom.exe",
 ];
 
 /// File names too common to identify a game on their own: runtimes and engines many programs
