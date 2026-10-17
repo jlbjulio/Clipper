@@ -1,0 +1,30 @@
+#include <winver.h>
+
+1 ICON "clipper.ico"
+2 ICON "paused.ico"
+1 24 "clipper.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Clipper"
+      VALUE "FileDescription", "Clipper"
+      VALUE "FileVersion", "0.1.0"
+      VALUE "InternalName", "clipper"
+      VALUE "OriginalFilename", "clipper.exe"
+      VALUE "ProductName", "Clipper"
+      VALUE "ProductVersion", "0.1.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
