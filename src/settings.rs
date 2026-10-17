@@ -16,9 +16,10 @@ use egui_software_backend::{
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem,
-    SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+    FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog,
+    IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
 };
 use windows::core::HSTRING;
 use windows_sys::Win32::Foundation::{
@@ -190,6 +191,34 @@ fn pick_folder(start: &Path) -> Option<PathBuf> {
         let path = name.to_string().ok().map(PathBuf::from);
         CoTaskMemFree(Some(name.0 as _));
         path
+    }
+}
+
+/// Asks for a program (.exe) to record as a game.
+fn pick_program(label: &str) -> Option<PathBuf> {
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog
+            .SetOptions(dialog.GetOptions().ok()? | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST)
+            .ok()?;
+        let (name, spec) = (HSTRING::from(label), HSTRING::from("*.exe"));
+        dialog
+            .SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: windows::core::PCWSTR(name.as_ptr()),
+                pszSpec: windows::core::PCWSTR(spec.as_ptr()),
+            }])
+            .ok()?;
+        let owner = windows::Win32::Foundation::HWND(GetForegroundWindow());
+        dialog.Show(Some(owner)).ok()?;
+        let path = dialog
+            .GetResult()
+            .ok()?
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .ok()?;
+        let exe = path.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(path.0 as _));
+        exe
     }
 }
 
@@ -774,6 +803,37 @@ impl Settings {
                             ui.selectable_value(&mut self.edit.gpu, g.clone(), g);
                         }
                     });
+            });
+        });
+
+        card(ui, tx.sec_games, p, |ui| {
+            let mut remove = None;
+            for (i, exe) in self.edit.extra_games.iter().enumerate() {
+                let name = exe
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let folder = exe
+                    .parent()
+                    .map(|f| f.display().to_string())
+                    .unwrap_or_default();
+                row(ui, &name, Some(&folder), p, i == 0, |ui| {
+                    if ui.button(tx.clear).clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                self.edit.extra_games.remove(i);
+            }
+            let first = self.edit.extra_games.is_empty();
+            row(ui, tx.add_game, None, p, first, |ui| {
+                if ui.button(tx.choose).clicked()
+                    && let Some(exe) = pick_program(tx.programs)
+                    && !self.edit.extra_games.contains(&exe)
+                {
+                    self.edit.extra_games.push(exe);
+                }
             });
         });
 

@@ -126,6 +126,8 @@ pub struct Config {
     pub mic_device: String,
     /// Record the desktop while no game is open; off records games only.
     pub record_desktop: bool,
+    /// Programs the user added as games, for those detection misses.
+    pub extra_games: Vec<PathBuf>,
     /// Record the monitor holding the focused window; otherwise always `monitor`.
     pub follow_focus: bool,
     /// Device name (\\.\DISPLAY1) of the fixed or fallback monitor; empty means the primary one.
@@ -177,6 +179,7 @@ impl Default for Config {
             system_device: String::new(),
             mic_device: String::new(),
             record_desktop: false,
+            extra_games: Vec::new(),
             follow_focus: true,
             monitor: String::new(),
             gpu: String::new(),
@@ -262,6 +265,15 @@ impl Config {
                 "system_audio_device" => c.system_device = value.to_string(),
                 "microphone_device" => c.mic_device = value.to_string(),
                 "record_desktop" => c.record_desktop = flag().unwrap_or(c.record_desktop),
+                // Separated by `|`, which Windows never allows in a path.
+                "extra_games" => {
+                    c.extra_games = value
+                        .split('|')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                }
                 "follow_focus" => c.follow_focus = flag().unwrap_or(c.follow_focus),
                 "monitor" => c.monitor = value.to_string(),
                 "gpu" => c.gpu = value.to_string(),
@@ -283,7 +295,7 @@ impl Config {
             "# Clipper settings. Edit here or from the tray icon > Settings.\n\
              clip_seconds = {}\nfps = {}\nquality = {}\nbitrate_kbps = {}\ncursor = {}\n\
              system_audio = {}\nmicrophone = {}\nsystem_audio_device = {}\nmicrophone_device = {}\n\
-             record_desktop = {}\nfollow_focus = {}\nmonitor = {}\ngpu = {}\n\
+             record_desktop = {}\nextra_games = {}\nfollow_focus = {}\nmonitor = {}\ngpu = {}\n\
              clip_hotkey = {}\nscreenshot_hotkey = {}\npause_hotkey = {}\n\
              clips_folder = {}\nscreenshots_folder = {}\n\
              notifications = {}\nstart_with_windows = {}\n",
@@ -297,6 +309,11 @@ impl Config {
             self.system_device,
             self.mic_device,
             self.record_desktop,
+            self.extra_games
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("|"),
             self.follow_focus,
             self.monitor,
             self.gpu,
@@ -337,6 +354,10 @@ mod tests {
                 .into(),
             mic_device: "Microphone (Blue Snowball)".into(),
             record_desktop: true,
+            extra_games: vec![
+                r"D:\Games\Some Private Server\wow.exe".into(),
+                r"C:\itch\tiny game\game.exe".into(),
+            ],
             follow_focus: false,
             monitor: r"\\.\DISPLAY2".into(),
             gpu: "NVIDIA GeForce RTX 3050 Laptop GPU".into(),

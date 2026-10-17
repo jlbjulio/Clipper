@@ -106,6 +106,8 @@ pub struct Game {
 }
 
 pub struct Games {
+    /// Lower-cased executable paths the user added as games in settings.
+    added: HashSet<String>,
     /// Lower-cased executable paths Windows lists as games.
     known: HashSet<String>,
     /// Their distinctive file names, such as wow.exe.
@@ -127,15 +129,25 @@ struct Window {
 }
 
 impl Games {
-    pub fn new() -> Games {
+    pub fn new(added: &[std::path::PathBuf]) -> Games {
         let known = known_games();
         Games {
+            added: lower_paths(added),
             known_names: file_names(&known),
             known,
             libraries: libraries(),
             loaded: Instant::now(),
             exes: HashMap::new(),
             full_screen: HashSet::new(),
+        }
+    }
+
+    /// Replaces the games the user added in settings.
+    pub fn set_added(&mut self, added: &[std::path::PathBuf]) {
+        let added = lower_paths(added);
+        if added != self.added {
+            self.added = added;
+            self.exes.clear();
         }
     }
 
@@ -188,13 +200,15 @@ impl Games {
     }
 
     fn exe(&mut self, pid: u32) -> &(String, bool) {
-        let (known, names, libraries) = (&self.known, &self.known_names, &self.libraries);
+        let (added, known, names, libraries) =
+            (&self.added, &self.known, &self.known_names, &self.libraries);
         self.exes.entry(pid).or_insert_with(|| {
             let exe = exe_path(pid);
             let lower = exe.to_lowercase();
             let name = lower.rsplit('\\').next().unwrap_or_default();
             let listed = !exe.is_empty()
-                && (known.contains(&lower)
+                && (added.contains(&lower)
+                    || known.contains(&lower)
                     || names.contains(name)
                     || libraries.iter().any(|l| lower.starts_with(l)));
             (exe, listed)
@@ -202,11 +216,16 @@ impl Games {
     }
 
     /// An unreadable path (anti-cheat may protect the process) is not a reason to exclude it;
-    /// it can still count as a game by going full screen.
+    /// it can still count as a game by going full screen. A program the user added always
+    /// counts.
     fn excluded(&mut self, pid: u32) -> bool {
-        let name = Path::new(&self.exe(pid).0)
+        let exe = self.exe(pid).0.to_lowercase();
+        if self.added.contains(&exe) {
+            return false;
+        }
+        let name = Path::new(&exe)
             .file_name()
-            .map(|n| n.to_string_lossy().to_lowercase())
+            .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         NOT_GAMES.contains(&name.as_str())
     }
@@ -307,6 +326,13 @@ fn known_games() -> HashSet<String> {
     .into_iter()
     .map(|p| p.to_lowercase())
     .collect()
+}
+
+fn lower_paths(paths: &[std::path::PathBuf]) -> HashSet<String> {
+    paths
+        .iter()
+        .map(|p| p.display().to_string().to_lowercase())
+        .collect()
 }
 
 /// The distinctive file names among `paths`.

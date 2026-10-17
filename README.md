@@ -10,6 +10,7 @@ It is a small replacement for the Xbox Game Bar's "record what happened": one 4 
 
 - **Records your games, not your desktop.** Clipper finds the games installed from Steam, Epic, Riot, GOG, Ubisoft, EA and the Xbox app, plus every game Windows itself has recognized, and records the game's own window. Switch to a browser or Discord with Alt+Tab and the clip still shows the game. With no game open, nothing is recorded and the GPU stays idle.
 - **Desktop recording when you want it.** Turn it on in settings and Clipper records the screen whenever no game is open, then goes back to the game when one starts.
+- **Missing a game?** Add its program in settings and Clipper always treats it as one: a standalone download, an itch.io game, a private server.
 - **Save the last 15 to 120 seconds** with one shortcut, whenever something worth keeping just happened. Clips go to `Videos\Captures`, the same folder Windows uses.
 - **Screenshots** of whatever the monitor you are using shows, saved as PNG next to your clips.
 - **Works over full-screen games.** Clips and screenshots capture borderless and exclusive full-screen games, and a game that changes the screen resolution keeps its picture in the clip.
@@ -45,7 +46,7 @@ Change them in settings: click a shortcut and press the new keys. If another app
 
 <p align="center"><img src="docs/settings.png" alt="Clipper settings window" width="560">&nbsp;&nbsp;<img src="docs/menu.png" alt="Tray menu" width="312"></p>
 
-Clip length, frame rate (30 or 60 fps), quality or a custom bitrate, shortcuts, audio devices, desktop recording, which monitor to use when no window has focus, and where files go. Changes apply as soon as you save, without restarting. Settings run in a separate window process that exits when you close it.
+Clip length, frame rate (30 or 60 fps), quality or a custom bitrate, shortcuts, audio devices, games you added, desktop recording, which monitor to use when no window has focus, and where files go. Changes apply as soon as you save, without restarting. Settings run in a separate window process that exits when you close it.
 
 ## Where things go
 

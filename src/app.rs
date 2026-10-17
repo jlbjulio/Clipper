@@ -450,6 +450,7 @@ impl App {
             self.register_keys();
         }
         self.fallback = fallback_monitor(&self.cfg);
+        self.games.set_added(&self.cfg.extra_games);
         let (target, game) = self.want();
         // New parameters start a new segment, which needs a fresh session to get its first frame.
         if !self.paused
@@ -712,7 +713,7 @@ pub fn run() {
 
     let fallback = fallback_monitor(&cfg);
     let monitor = target_monitor(&cfg, fallback);
-    let games = Games::new();
+    let games = Games::new(&cfg.extra_games);
     let mut app = App {
         cfg,
         tray,
