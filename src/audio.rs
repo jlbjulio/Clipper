@@ -21,14 +21,19 @@ pub struct Mixer {
     sources: Arc<Mutex<Vec<Queue>>>,
     pub system: Arc<AtomicBool>,
     pub mic: Arc<AtomicBool>,
+    /// Chosen devices by name; empty means automatic.
+    pub output: Arc<Mutex<String>>,
+    pub input: Arc<Mutex<String>>,
 }
 
 impl Mixer {
-    pub fn new(system: bool, mic: bool) -> Self {
+    pub fn new(system: bool, mic: bool, output: &str, input: &str) -> Self {
         Self {
             sources: Arc::default(),
             system: Arc::new(AtomicBool::new(system)),
             mic: Arc::new(AtomicBool::new(mic)),
+            output: Arc::new(Mutex::new(output.to_string())),
+            input: Arc::new(Mutex::new(input.to_string())),
         }
     }
 
@@ -53,28 +58,63 @@ impl Mixer {
     }
 }
 
-/// What to loop back for "system audio". SteelSeries Sonar holds the physical device in
-/// exclusive mode, where loopback hears nothing, so when Sonar is present its virtual outputs
-/// (Gaming, Chat, Media...) are captured instead; otherwise the default output.
-fn system_outputs(host: &cpal::Host) -> Vec<cpal::Device> {
-    let name = |d: &cpal::Device| {
-        d.description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_default()
-    };
-    let sonar: Vec<_> = host
+pub fn device_name(d: &cpal::Device) -> String {
+    d.description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_default()
+}
+
+/// Names of the playback and recording devices, for the settings window.
+pub fn device_names() -> (Vec<String>, Vec<String>) {
+    let host = cpal::default_host();
+    let names =
+        |it: Option<Vec<cpal::Device>>| it.unwrap_or_default().iter().map(device_name).collect();
+    (
+        names(host.output_devices().ok().map(|i| i.collect())),
+        names(host.input_devices().ok().map(|i| i.collect())),
+    )
+}
+
+/// What to loop back for "system audio". A chosen device wins while it is connected.
+/// Otherwise: when the Windows default output is one of SteelSeries Sonar's virtual devices,
+/// all of Sonar's outputs (Gaming, Chat, Media...), since apps are spread across them and Sonar
+/// holds the real speakers in exclusive mode where loopback hears nothing. In every other case
+/// the default output, which is where apps play.
+fn system_outputs(host: &cpal::Host, chosen: &str) -> Vec<cpal::Device> {
+    let outputs: Vec<cpal::Device> = host
         .output_devices()
-        // Sonar's "Microphone" render endpoint carries the processed mic, already captured as input.
-        .map(|it| {
-            it.filter(|d| name(d).contains("Sonar") && !name(d).contains("Microphone"))
-                .collect()
-        })
+        .map(|i| i.collect())
         .unwrap_or_default();
-    if sonar.is_empty() {
-        host.default_output_device().into_iter().collect()
-    } else {
-        sonar
+    if let Some(d) = outputs
+        .iter()
+        .find(|d| !chosen.is_empty() && device_name(d) == chosen)
+    {
+        return vec![d.clone()];
     }
+    let default = host.default_output_device();
+    if default
+        .as_ref()
+        .is_some_and(|d| device_name(d).contains("Sonar"))
+    {
+        // Sonar's "Microphone" output carries the processed mic, already captured as input.
+        let sonar = |d: &&cpal::Device| {
+            device_name(d).contains("Sonar") && !device_name(d).contains("Microphone")
+        };
+        return outputs.iter().filter(sonar).cloned().collect();
+    }
+    default.into_iter().collect()
+}
+
+/// The microphone: the chosen one while connected, otherwise the Windows default.
+fn microphone(host: &cpal::Host, chosen: &str) -> Option<cpal::Device> {
+    let chosen_device = (!chosen.is_empty())
+        .then(|| {
+            host.input_devices()
+                .ok()?
+                .find(|d| device_name(d) == chosen)
+        })
+        .flatten();
+    chosen_device.or_else(|| host.default_input_device())
 }
 
 /// Keeps the capture streams open, reopening them when devices come and go (e.g. AirPods
@@ -89,10 +129,16 @@ pub fn spawn(mixer: Mixer) {
             // Disabled sources are simply not opened, so toggling one counts as a device change.
             let mut devices: Vec<(cpal::Device, bool)> = Vec::new();
             if mixer.system.load(Ordering::Acquire) {
-                devices.extend(system_outputs(&host).into_iter().map(|d| (d, true)));
+                let chosen = mixer.output.lock().unwrap().clone();
+                devices.extend(
+                    system_outputs(&host, &chosen)
+                        .into_iter()
+                        .map(|d| (d, true)),
+                );
             }
             if mixer.mic.load(Ordering::Acquire) {
-                devices.extend(host.default_input_device().map(|d| (d, false)));
+                let chosen = mixer.input.lock().unwrap().clone();
+                devices.extend(microphone(&host, &chosen).map(|d| (d, false)));
             }
             let ids: Vec<_> = devices.iter().map(|(d, _)| d.id().ok()).collect();
             if ids != current || lost.swap(false, Ordering::AcqRel) {

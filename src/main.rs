@@ -5,7 +5,10 @@ mod audio;
 mod capture;
 mod config;
 mod encoder;
+mod hotkeys;
 mod mp4;
+mod nvenc;
+mod overlay;
 mod recorder;
 mod settings;
 mod text;
@@ -62,5 +65,7 @@ fn main() {
     // Keep one previous run's log for bug reports; never let it grow without bound.
     let _ = fs::rename(&log_path, dir.join("clipper.old.log"));
     let _ = LOG.set(log_path);
+    // Release builds abort on panic; leave the reason in the log for bug reports.
+    std::panic::set_hook(Box::new(|info| log(&format!("crash: {info}"))));
     app::run();
 }

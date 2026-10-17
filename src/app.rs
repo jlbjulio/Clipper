@@ -10,30 +10,32 @@ use std::{env, fs, thread};
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, POINT};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, POINT};
 use windows_sys::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint, MonitorFromWindow,
 };
-use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
 };
-use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, KillTimer,
-    MB_ICONHAND, MB_OK, MSG, SW_SHOWNORMAL, SetTimer, TranslateMessage, WM_CONTEXTMENU, WM_HOTKEY,
-    WM_TIMER, WM_USER,
+    DispatchMessageW, GUI_INMOVESIZE, GUITHREADINFO, GetClassNameW, GetCursorPos,
+    GetForegroundWindow, GetGUIThreadInfo, GetMessageW, GetWindowThreadProcessId, KillTimer, MSG,
+    SW_SHOWNORMAL, SetTimer, TranslateMessage, WM_CONTEXTMENU, WM_HOTKEY, WM_TIMER, WM_USER,
 };
 
 use crate::config::{Config, Hotkey};
+use crate::overlay::Overlay;
 use crate::recorder::{Outcome, Params, Recorder};
 use crate::text::t;
 use crate::tray::{self, Tray, wide};
-use crate::{audio, capture, log, now_ticks, stamp};
+use crate::{audio, capture, hotkeys, log, now_ticks, stamp};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+};
 
 const HK_CLIP: i32 = 1;
 const HK_SHOT: i32 = 2;
@@ -41,10 +43,11 @@ const HK_PAUSE: i32 = 3;
 
 const NIN_SELECT: usize = WM_USER as usize;
 const NIN_KEYSELECT: usize = WM_USER as usize + 1;
-const NIN_BALLOONUSERCLICK: usize = WM_USER as usize + 5;
 
 /// Timer id that re-enables shortcuts if the settings window disappears mid-capture.
 const KEYS_TIMEOUT: usize = 2;
+/// Timer id that animates the saved notification.
+const OVERLAY_TIMER: usize = 3;
 
 const MENU_CLIP: u32 = 1;
 const MENU_SHOT: u32 = 2;
@@ -85,14 +88,6 @@ fn open_folder(dir: &Path) {
     shell_open(&dir.display().to_string(), None);
 }
 
-/// Opens Explorer with the file selected.
-fn reveal(file: &Path) {
-    shell_open(
-        "explorer.exe",
-        Some(&format!("/select,\"{}\"", file.display())),
-    );
-}
-
 pub fn open_settings() {
     if let Ok(exe) = env::current_exe() {
         let _ = std::process::Command::new(exe).arg("--settings").spawn();
@@ -122,10 +117,6 @@ fn set_autostart(on: bool) {
             );
         }
     }
-}
-
-fn beep(ok: bool) {
-    unsafe { MessageBeep(if ok { MB_OK } else { MB_ICONHAND }) };
 }
 
 fn params(c: &Config) -> Params {
@@ -162,6 +153,47 @@ fn target_monitor(cfg: &Config, fallback: usize) -> usize {
     }
 }
 
+/// True while the focused window should not be followed: the Alt+Tab switcher, a window being
+/// dragged (switching mid-drag would wake the other GPU and stall the desktop under the user's
+/// hand), and Clipper's own settings window, which is nothing to record.
+fn hold_focus() -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_null() {
+            return false;
+        }
+        // Alt+Tab, Task View and the brief staging window between them hold the focus while the
+        // user is still choosing; the window picked next decides.
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(fg, class.as_mut_ptr(), class.len() as i32) as usize;
+        if matches!(
+            String::from_utf16_lossy(&class[..n]).as_str(),
+            "XamlExplorerHostIslandWindow" | "MultitaskingViewFrame" | "ForegroundStaging"
+        ) {
+            return true;
+        }
+        let mut pid = 0;
+        let thread = GetWindowThreadProcessId(fg, &mut pid);
+        let mut gui = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..std::mem::zeroed()
+        };
+        if GetGUIThreadInfo(thread, &mut gui) != 0 && gui.flags & GUI_INMOVESIZE != 0 {
+            return true;
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(process);
+        ok && env::current_exe()
+            .is_ok_and(|me| Path::new(&String::from_utf16_lossy(&buf[..len as usize])) == me)
+    }
+}
+
 fn fallback_monitor(cfg: &Config) -> usize {
     let list = capture::monitors();
     list.iter()
@@ -185,44 +217,74 @@ struct App {
     candidate: (usize, u8),
     paused: bool,
     keys_on: bool,
-    taken: Vec<&'static str>,
-    last_saved: Option<PathBuf>,
+    overlay: Overlay,
+    /// The monitor's resolution when the current session started.
+    mode: Option<(u32, u32)>,
+    /// A GPU that could not be opened; not retried until the user picks another in settings.
+    failed_gpu: Option<String>,
 }
 
 impl App {
-    /// Uses the GPU the monitor is plugged into (or the one chosen in settings), so frames never
-    /// have to cross between cards.
-    fn pick_gpu(&mut self, hmon: HMONITOR) {
+    /// Uses the most power-efficient GPU for every monitor (or the one chosen in settings).
+    fn pick_gpu(&mut self) {
         let wanted = if self.cfg.gpu.is_empty() {
-            capture::adapter_of(hmon).unwrap_or_default()
+            capture::power_saving_adapter().unwrap_or_default()
         } else {
             self.cfg.gpu.clone()
         };
-        if wanted.is_empty() || wanted == self.gpu.name {
+        // An unknown GPU, the one in use, or one that already failed: keep what works. Retrying
+        // a failed card on every monitor switch would only churn devices and encoders.
+        if wanted.is_empty() || wanted == self.gpu.name || self.failed_gpu.as_ref() == Some(&wanted)
+        {
             return;
         }
         match capture::Gpu::new(&wanted) {
+            // Gpu::new falls back to the software renderer; never trade working hardware for it.
+            Ok(g) if g.software && !self.gpu.software => {
+                log(&format!(
+                    "cannot use {wanted}; staying on {}",
+                    self.gpu.name
+                ));
+                self.failed_gpu = Some(wanted);
+            }
             Ok(g) => {
                 log(&format!("using {}", g.name));
                 self.gpu = Arc::new(g);
                 self.rec.set_gpu(self.gpu.clone());
             }
-            Err(e) => log(&format!("cannot use {wanted}: {e}")),
+            Err(e) => {
+                log(&format!("cannot use {wanted}: {e}"));
+                self.failed_gpu = Some(wanted);
+            }
+        }
+    }
+
+    /// The frame rate actually recorded: CPU encoding is capped at 30 fps (see the recorder).
+    fn effective_fps(&self) -> u32 {
+        if self.gpu.software || !capture::hardware_encoder() {
+            self.cfg.fps.min(30)
+        } else {
+            self.cfg.fps
         }
     }
 
     fn begin(&mut self) {
         drop(self.session.take());
         let hmon = HMONITOR(self.monitor as _);
-        self.pick_gpu(hmon);
+        self.mode = capture::monitor_pixels(hmon);
+        self.pick_gpu();
         // The encoder has to exist before the session starts: on a static screen the session's
         // first frame may be the only one for a long time.
         let started = capture::monitor_size(hmon).and_then(|size| {
             self.rec.set_size(size);
             let sink = self.rec.clone();
-            capture::start(&self.gpu, hmon, self.cfg.cursor, move |tex, ts| {
-                sink.on_frame(tex, ts)
-            })
+            capture::start(
+                &self.gpu,
+                hmon,
+                self.cfg.cursor,
+                Some(self.effective_fps()),
+                move |tex, ts| sink.on_frame(tex, ts),
+            )
         });
         match started {
             Ok(s) => self.session = Some(s),
@@ -231,46 +293,27 @@ impl App {
         self.publish();
     }
 
+    /// Registers the shortcuts with Windows; any combination another app already reserved
+    /// goes to the keyboard hook instead. Ids follow the HK_* constants.
     fn register_keys(&mut self) {
-        let keys = [
-            (HK_CLIP, self.cfg.clip_key, "clip"),
-            (HK_SHOT, self.cfg.shot_key, "shot"),
-            (HK_PAUSE, self.cfg.pause_key, "pause"),
-        ];
-        self.taken.clear();
-        for (id, key, name) in keys {
+        let keys = [self.cfg.clip_key, self.cfg.shot_key, self.cfg.pause_key];
+        let mut hooked = [Hotkey::NONE; 3];
+        for (i, key) in keys.into_iter().enumerate() {
+            let id = i as i32 + 1;
             unsafe { UnregisterHotKey(self.tray.hwnd, id) };
-            if self.keys_on
+            let registered = self.keys_on
                 && key.is_set()
                 && unsafe { RegisterHotKey(self.tray.hwnd, id, key.mods | MOD_NOREPEAT, key.vk) }
-                    == 0
-            {
-                self.taken.push(name);
+                    != 0;
+            if self.keys_on && key.is_set() && !registered {
+                log(&format!(
+                    "{} is reserved by another app; using the keyboard hook",
+                    key.label()
+                ));
+                hooked[i] = key;
             }
         }
-    }
-
-    fn warn_taken(&mut self) {
-        let keys: Vec<String> = [
-            (self.cfg.clip_key, "clip"),
-            (self.cfg.shot_key, "shot"),
-            (self.cfg.pause_key, "pause"),
-        ]
-        .iter()
-        .filter(|(_, n)| self.taken.contains(n))
-        .map(|(k, _)| k.label())
-        .collect();
-        if !keys.is_empty() {
-            log(&format!(
-                "shortcuts taken by another app: {}",
-                keys.join(", ")
-            ));
-            self.tray.notify(
-                "Clipper",
-                &format!("{} {}", keys.join(", "), t().key_taken),
-                true,
-            );
-        }
+        hotkeys::set(hooked, self.keys_on);
     }
 
     /// Updates the tray icon and the status line the settings window shows.
@@ -288,16 +331,18 @@ impl App {
         };
         self.tray.set_state(recording, &tip);
         self.tray.set_status(&format!(
-            "state={};monitor={};gpu={};taken={}",
+            "state={};monitor={};gpu={}",
             if recording { "recording" } else { "paused" },
             device,
             self.gpu.name,
-            self.taken.join(",")
         ));
     }
 
     fn apply(&mut self, new: Config) {
         let old = std::mem::replace(&mut self.cfg, new);
+        if old.gpu != self.cfg.gpu {
+            self.failed_gpu = None;
+        }
 
         set_autostart(self.cfg.autostart);
         self.mixer
@@ -307,12 +352,13 @@ impl App {
             .mic
             .store(self.cfg.mic, std::sync::atomic::Ordering::Release);
         let params_changed = params(&old) != params(&self.cfg);
+        *self.mixer.output.lock().unwrap() = self.cfg.system_device.clone();
+        *self.mixer.input.lock().unwrap() = self.cfg.mic_device.clone();
         self.rec.set_params(params(&self.cfg));
         let keys_changed = (old.clip_key, old.shot_key, old.pause_key)
             != (self.cfg.clip_key, self.cfg.shot_key, self.cfg.pause_key);
         if keys_changed {
             self.register_keys();
-            self.warn_taken();
         }
         self.fallback = fallback_monitor(&self.cfg);
         let monitor = target_monitor(&self.cfg, self.fallback);
@@ -381,32 +427,27 @@ impl App {
             ),
             Saved::Shot(r) => (t().shot_saved, t().shot_failed, r.map(|p| (p, None))),
         };
+        // Shown on the monitor in use, where the player is looking.
+        let monitor = target_monitor(&self.cfg, self.fallback);
         match result {
             Ok((path, bytes)) => {
-                if self.cfg.sound {
-                    beep(true);
-                }
                 if self.cfg.notify {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let size = bytes
-                        .map(|b| format!(" · {:.0} MB", b as f64 / 1e6))
-                        .unwrap_or_default();
-                    self.tray.notify(
-                        ok_title,
-                        &format!("{name}{size}\n{}", t().click_to_open),
-                        false,
-                    );
+                    let folder = path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned());
+                    let detail = match bytes {
+                        Some(b) => format!("{} s · {:.0} MB", self.cfg.clip_secs, b as f64 / 1e6),
+                        None => folder.unwrap_or_default(),
+                    };
+                    self.overlay.show(monitor, ok_title, &detail);
+                    unsafe { SetTimer(self.tray.hwnd, OVERLAY_TIMER, 30, None) };
                 }
-                self.last_saved = Some(path);
             }
             Err(e) => {
-                if self.cfg.sound {
-                    beep(false);
-                }
-                self.tray.notify(fail_title, &e, true);
+                // Failures always show, even with notifications off.
+                self.overlay.show(monitor, fail_title, &e);
+                unsafe { SetTimer(self.tray.hwnd, OVERLAY_TIMER, 30, None) };
             }
         }
     }
@@ -459,7 +500,11 @@ impl App {
             return;
         }
         // Follow the focused window to another monitor once it has stayed there for ~1 s.
-        let m = target_monitor(&self.cfg, self.fallback);
+        // The process lookup in hold_focus only runs when the focus is on another monitor.
+        let m = match target_monitor(&self.cfg, self.fallback) {
+            m if m != self.monitor && hold_focus() => self.monitor,
+            m => m,
+        };
         self.candidate = if m == self.candidate.0 {
             (m, self.candidate.1.saturating_add(1))
         } else {
@@ -467,7 +512,9 @@ impl App {
         };
         let moved = m != self.monitor && self.candidate.1 >= 2;
         // Windows ends a session on display changes (resolution, unplugging, sleep).
-        let dead = self.session.as_ref().is_none_or(|s| s.is_closed());
+        // A game switching the display mode is compared against the mode the session started in.
+        let mode = capture::monitor_pixels(HMONITOR(self.monitor as _));
+        let dead = self.session.as_ref().is_none_or(|s| s.is_stale()) || mode != self.mode;
         if moved || dead {
             if moved {
                 log("following focus to another monitor");
@@ -482,6 +529,20 @@ impl App {
             self.begin();
         }
     }
+}
+
+/// Explains a problem that stops Clipper from starting, then exits.
+fn fatal(message: &str) -> ! {
+    log(message);
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            null_mut(),
+            wide(message).as_ptr(),
+            wide("Clipper").as_ptr(),
+            windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+        )
+    };
+    std::process::exit(1)
 }
 
 /// Holds the single-instance lock. Returns false when another Clipper already runs.
@@ -514,14 +575,24 @@ pub fn run() {
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        MFStartup(MF_VERSION, MFSTARTUP_FULL).expect("Media Foundation is unavailable");
+        if MFStartup(MF_VERSION, MFSTARTUP_FULL).is_err() {
+            fatal(t().no_media);
+        }
     }
-    let gpu = Arc::new(capture::Gpu::new(&cfg.gpu).expect("no usable Direct3D 11 GPU"));
+    let gpu = match capture::Gpu::new(&cfg.gpu) {
+        Ok(g) => Arc::new(g),
+        Err(e) => fatal(&format!("{} ({e})", t().no_capture)),
+    };
     log(&format!("using {}", gpu.name));
     let tray = Tray::new();
     let hwnd = tray.hwnd as usize;
 
-    let mixer = audio::Mixer::new(cfg.system_audio, cfg.mic);
+    let mixer = audio::Mixer::new(
+        cfg.system_audio,
+        cfg.mic,
+        &cfg.system_device,
+        &cfg.mic_device,
+    );
     audio::spawn(mixer.clone());
     let rec = Recorder::new(gpu.clone(), segs, params(&cfg), move |outcome| {
         post_saved(hwnd, Saved::Clip(outcome))
@@ -550,12 +621,13 @@ pub fn run() {
         candidate: (monitor, 0),
         paused: false,
         keys_on: true,
-        taken: Vec::new(),
-        last_saved: None,
+        overlay: Overlay::new(),
+        mode: None,
+        failed_gpu: None,
     };
     set_autostart(app.cfg.autostart);
+    hotkeys::start(app.tray.hwnd as usize);
     app.register_keys();
-    app.warn_taken();
     app.begin();
     log(&format!(
         "Clipper running; clip {}, screenshot {}",
@@ -573,6 +645,11 @@ pub fn run() {
                 app.keys_on = true;
                 app.register_keys();
             }
+            WM_TIMER if msg.wParam == OVERLAY_TIMER => {
+                if !app.overlay.tick() {
+                    unsafe { KillTimer(app.tray.hwnd, OVERLAY_TIMER) };
+                }
+            }
             WM_TIMER => app.tick(),
             WM_HOTKEY => match msg.wParam as i32 {
                 HK_CLIP => app.save_clip(),
@@ -583,11 +660,6 @@ pub fn run() {
             tray::WM_TRAY => match msg.wParam {
                 NIN_SELECT | NIN_KEYSELECT => open_settings(),
                 x if x == WM_CONTEXTMENU as usize => app.menu(),
-                NIN_BALLOONUSERCLICK => {
-                    if let Some(p) = &app.last_saved {
-                        reveal(p);
-                    }
-                }
                 _ => {}
             },
             tray::WM_SAVED => {

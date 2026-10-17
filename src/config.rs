@@ -118,6 +118,10 @@ pub struct Config {
     pub cursor: bool,
     pub system_audio: bool,
     pub mic: bool,
+    /// Playback device to record by name; empty picks automatically.
+    pub system_device: String,
+    /// Microphone by name; empty uses the Windows default.
+    pub mic_device: String,
     /// Record the monitor holding the focused window; otherwise always `monitor`.
     pub follow_focus: bool,
     /// Device name (\\.\DISPLAY1) of the fixed or fallback monitor; empty means the primary one.
@@ -130,17 +134,28 @@ pub struct Config {
     pub clips_dir: PathBuf,
     pub shots_dir: PathBuf,
     pub notify: bool,
-    pub sound: bool,
     pub autostart: bool,
 }
 
 pub const CLIP_LENGTHS: [u32; 5] = [15, 30, 60, 90, 120];
 pub const FRAME_RATES: [u32; 2] = [30, 60];
 
-fn home(sub: &[&str]) -> PathBuf {
-    let mut p = PathBuf::from(env::var_os("USERPROFILE").unwrap_or_default());
-    p.extend(sub);
-    p
+/// Videos\Captures, where Windows' own Game Bar saves clips and screenshots. The Videos folder
+/// comes from Windows, so it follows a library moved to OneDrive or another drive.
+fn captures() -> PathBuf {
+    use windows::Win32::UI::Shell::{FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    let videos = unsafe { SHGetKnownFolderPath(&FOLDERID_Videos, KF_FLAG_DEFAULT, None) }
+        .ok()
+        .and_then(|p| {
+            let path = unsafe { p.to_string() }.ok();
+            unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as _)) };
+            path
+        })
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var_os("USERPROFILE").unwrap_or_default()).join("Videos")
+        });
+    videos.join("Captures")
 }
 
 impl Default for Config {
@@ -152,25 +167,26 @@ impl Default for Config {
             cursor: true,
             system_audio: true,
             mic: true,
+            system_device: String::new(),
+            mic_device: String::new(),
             follow_focus: true,
             monitor: String::new(),
             gpu: String::new(),
             clip_key: Hotkey {
                 mods: MOD_ALT,
-                vk: 0x79,
-            }, // Alt+F10
+                vk: 0x47,
+            }, // Alt+G
             shot_key: Hotkey {
                 mods: MOD_ALT,
-                vk: 0x7B,
-            }, // Alt+F12
+                vk: 0x70,
+            }, // Alt+F1
             pause_key: Hotkey {
                 mods: MOD_ALT,
                 vk: 0x78,
             }, // Alt+F9
-            clips_dir: home(&["Videos", "Clipper"]),
-            shots_dir: home(&["Pictures", "Clipper"]),
+            clips_dir: captures(),
+            shots_dir: captures(),
             notify: true,
-            sound: true,
             autostart: true,
         }
     }
@@ -228,6 +244,8 @@ impl Config {
                 "cursor" => c.cursor = flag().unwrap_or(c.cursor),
                 "system_audio" => c.system_audio = flag().unwrap_or(c.system_audio),
                 "microphone" => c.mic = flag().unwrap_or(c.mic),
+                "system_audio_device" => c.system_device = value.to_string(),
+                "microphone_device" => c.mic_device = value.to_string(),
                 "follow_focus" => c.follow_focus = flag().unwrap_or(c.follow_focus),
                 "monitor" => c.monitor = value.to_string(),
                 "gpu" => c.gpu = value.to_string(),
@@ -237,7 +255,6 @@ impl Config {
                 "clips_folder" if !value.is_empty() => c.clips_dir = value.into(),
                 "screenshots_folder" if !value.is_empty() => c.shots_dir = value.into(),
                 "notifications" => c.notify = flag().unwrap_or(c.notify),
-                "sound" => c.sound = flag().unwrap_or(c.sound),
                 "start_with_windows" => c.autostart = flag().unwrap_or(c.autostart),
                 _ => {}
             }
@@ -249,17 +266,19 @@ impl Config {
         format!(
             "# Clipper settings. Edit here or from the tray icon > Settings.\n\
              clip_seconds = {}\nfps = {}\nquality = {}\ncursor = {}\n\
-             system_audio = {}\nmicrophone = {}\n\
+             system_audio = {}\nmicrophone = {}\nsystem_audio_device = {}\nmicrophone_device = {}\n\
              follow_focus = {}\nmonitor = {}\ngpu = {}\n\
              clip_hotkey = {}\nscreenshot_hotkey = {}\npause_hotkey = {}\n\
              clips_folder = {}\nscreenshots_folder = {}\n\
-             notifications = {}\nsound = {}\nstart_with_windows = {}\n",
+             notifications = {}\nstart_with_windows = {}\n",
             self.clip_secs,
             self.fps,
             self.quality.key(),
             self.cursor,
             self.system_audio,
             self.mic,
+            self.system_device,
+            self.mic_device,
             self.follow_focus,
             self.monitor,
             self.gpu,
@@ -269,7 +288,6 @@ impl Config {
             self.clips_dir.display(),
             self.shots_dir.display(),
             self.notify,
-            self.sound,
             self.autostart,
         )
     }
@@ -296,6 +314,9 @@ mod tests {
             cursor: false,
             system_audio: false,
             mic: false,
+            system_device: "SteelSeries Sonar - Gaming (SteelSeries Sonar Virtual Audio Device)"
+                .into(),
+            mic_device: "Microphone (Blue Snowball)".into(),
             follow_focus: false,
             monitor: r"\\.\DISPLAY2".into(),
             gpu: "NVIDIA GeForce RTX 3050 Laptop GPU".into(),
@@ -311,7 +332,6 @@ mod tests {
             clips_dir: r"D:\Clips".into(),
             shots_dir: r"D:\Shots".into(),
             notify: false,
-            sound: false,
             autostart: false,
         };
         assert_eq!(Config::parse(&c.to_text()), c);

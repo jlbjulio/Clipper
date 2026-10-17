@@ -329,6 +329,40 @@ pub fn join(sources: &[Source], from: i64, out: &Path) -> io::Result<()> {
         .iter()
         .map(|s| read(&s.path))
         .collect::<io::Result<_>>()?;
+    // A clip never mixes resolutions (a game switching the display mode, or monitors of
+    // different sizes): players handle a mid-file size change badly. Of the runs of same-size
+    // segments, keep the one covering most of the requested window, so leaving a full-screen
+    // game and saving two seconds later still keeps the game.
+    let size = |tracks: &[Track]| {
+        tracks
+            .iter()
+            .find(|t| t.kind == Kind::Video)
+            .map(|t| (be16(&t.entry, 32).ok(), be16(&t.entry, 34).ok()))
+    };
+    let end_of = |i: usize| {
+        let ends = parsed[i].iter().map(|t| {
+            let end = t.samples.last().map_or(0, |s| s.dts + s.duration as u64) as i64 + t.start;
+            (end as i128 * TICKS as i128 / t.timescale as i128) as i64
+        });
+        sources[i].start + ends.max().unwrap_or(0)
+    };
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for i in 0..parsed.len() {
+        match runs.last_mut() {
+            Some(run) if size(&parsed[run.0]) == size(&parsed[i]) => run.1 = i + 1,
+            _ => runs.push((i, i + 1)),
+        }
+    }
+    let covered =
+        |&(lo, hi): &(usize, usize)| (end_of(hi - 1) - sources[lo].start.max(from)).max(0);
+    // max_by_key keeps the last of equals: on a tie, the most recent run wins.
+    let (lo, hi) = runs.iter().copied().max_by_key(covered).unwrap_or((0, 0));
+    let (sources, parsed) = (&sources[lo..hi], &parsed[lo..hi]);
+    let from = if lo > 0 {
+        from.max(sources[0].start)
+    } else {
+        from
+    };
     // Shared-clock time of a sample, honoring the source's own edit list.
     let abs = |src: usize, t: &Track, dts: u64| {
         sources[src].start
@@ -939,6 +973,76 @@ mod tests {
             as f64
             / VIDEO_TS as f64;
         assert!((end - 14.0).abs() < 0.05, "{end}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_resolution_change_keeps_one_size_and_prefers_the_latest_on_a_tie() {
+        let dir = temp_dir("modes");
+        let a = segment(&dir, "a", 600, 469, 1);
+        let b = segment(&dir, "b", 600, 469, 2);
+        // Re-describe b as 1280x720, as after a game switched the display mode.
+        let mut bytes = std::fs::read(&b).unwrap();
+        // The sample entry, not the "avc1" brand listed in ftyp.
+        let stsd = bytes.windows(4).position(|w| w == b"stsd").unwrap();
+        let at = stsd + bytes[stsd..].windows(4).position(|w| w == b"avc1").unwrap() - 4;
+        bytes[at + 32..at + 34].copy_from_slice(&1280u16.to_be_bytes());
+        bytes[at + 34..at + 36].copy_from_slice(&720u16.to_be_bytes());
+        std::fs::write(&b, bytes).unwrap();
+        let out = dir.join("clip.mp4");
+        let sources = [
+            Source { path: a, start: 0 },
+            Source {
+                path: b,
+                start: 10 * TICKS,
+            },
+        ];
+        join(&sources, 0, &out).unwrap();
+        let tracks = read(&out).unwrap();
+        let v = tracks.iter().find(|t| t.kind == Kind::Video).unwrap();
+        assert_eq!(be16(&v.entry, 32).unwrap(), 1280);
+        assert_eq!(v.samples.len(), 600, "only the 1280x720 segment");
+        assert_eq!(bytes_of(&out, &v.samples[0]), payload(2, 0, 200));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Rewrites a segment's video sample entry to another size, as after a display mode change.
+    fn resize(path: &Path, w: u16, h: u16) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let stsd = bytes.windows(4).position(|x| x == b"stsd").unwrap();
+        let at = stsd + bytes[stsd..].windows(4).position(|x| x == b"avc1").unwrap() - 4;
+        bytes[at + 32..at + 34].copy_from_slice(&w.to_be_bytes());
+        bytes[at + 34..at + 36].copy_from_slice(&h.to_be_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn leaving_a_full_screen_game_keeps_the_game_in_the_clip() {
+        let dir = temp_dir("alttab");
+        // 10 s of game at 1280x720, then 2 s of desktop at 1920x1080 before the save.
+        let game = segment(&dir, "game", 600, 469, 1);
+        resize(&game, 1280, 720);
+        let desktop = segment(&dir, "desktop", 120, 94, 2);
+        let out = dir.join("clip.mp4");
+        let sources = [
+            Source {
+                path: game,
+                start: 0,
+            },
+            Source {
+                path: desktop,
+                start: 10 * TICKS,
+            },
+        ];
+        join(&sources, 0, &out).unwrap();
+        let tracks = read(&out).unwrap();
+        let v = tracks.iter().find(|t| t.kind == Kind::Video).unwrap();
+        assert_eq!(
+            be16(&v.entry, 32).unwrap(),
+            1280,
+            "the longer run, the game, is kept"
+        );
+        assert_eq!(v.samples.len(), 600);
         std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -123,7 +123,12 @@ impl Recorder {
             self.seq.fetch_add(1, Ordering::Relaxed)
         ));
         let (w, h) = *self.size.lock().unwrap();
-        let p = *self.params.lock().unwrap();
+        let mut p = *self.params.lock().unwrap();
+        if gpu.software || !crate::capture::hardware_encoder() {
+            // CPU encoding: keep it light enough to leave the game its processor.
+            p.fps = p.fps.min(30);
+            p.quality = Quality::Low;
+        }
         let enc = Encoder::new(&gpu, &path, w, h, p.fps, p.quality.bitrate(w, h, p.fps))?;
         Ok((gpu, enc, path, TICKS / p.fps as i64))
     }
@@ -177,7 +182,7 @@ impl Recorder {
     pub fn set_size(self: &Arc<Self>, size: (u32, u32)) {
         let changed = std::mem::replace(&mut *self.size.lock().unwrap(), size) != size;
         if changed || self.active.lock().unwrap().is_none() {
-            // ponytail: a clip spanning a resolution change gets two sample entries; most players handle it, some glitch at the seam.
+            // A clip never spans two sizes: mp4::join keeps the run that covers most of it.
             drop(self.spare.lock().unwrap().take());
             self.cut();
         }
@@ -238,7 +243,8 @@ impl Recorder {
         };
         let first = *a.first.get_or_insert(ts);
         a.last = ts;
-        if let Err(e) = a.enc.video(&a.gpu, tex, ts - first) {
+        let res = a.enc.video(&a.gpu, tex, ts - first);
+        if let Err(e) = res {
             log(&format!("video encode failed: {e}"));
         }
     }

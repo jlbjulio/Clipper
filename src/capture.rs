@@ -1,7 +1,7 @@
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use windows::Foundation::TypedEventHandler;
@@ -13,7 +13,7 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::GENERIC_WRITE;
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
@@ -21,8 +21,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice,
-    IDXGIFactory1,
+    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_GPU_PREFERENCE_MINIMUM_POWER,
+    IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIFactory6,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
@@ -31,8 +31,12 @@ use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA,
     IWICImagingFactory, WICBitmapEncoderNoCache,
 };
-use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::Media::MediaFoundation::{
+    IMFActivate, IMFDXGIDeviceManager, MFCreateDXGIDeviceManager, MFMediaType_Video,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
+};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
@@ -47,6 +51,10 @@ pub struct Gpu {
     pub manager: IMFDXGIDeviceManager,
     winrt: IDirect3DDevice,
     pub name: String,
+    /// PCI vendor id: 0x10DE NVIDIA, 0x1002 AMD, 0x8086 Intel.
+    pub vendor: u32,
+    /// Windows' software rasterizer (no usable GPU): frames have to be encoded on the CPU.
+    pub software: bool,
 }
 
 // The device is multithread-protected and Media Foundation objects are free-threaded.
@@ -77,20 +85,62 @@ fn adapter_name(a: &IDXGIAdapter1) -> String {
     String::from_utf16_lossy(&desc.Description[..len])
 }
 
+/// `CLIPPER_SOFTWARE=1` forces software capture and encoding: a workaround for a broken
+/// graphics driver, and how the no-GPU path is tested on machines that have one.
+pub fn software_only() -> bool {
+    std::env::var_os("CLIPPER_SOFTWARE").is_some_and(|v| v == "1")
+}
+
+/// Whether any hardware H.264 encoder is installed. Without one, Media Foundation falls back to
+/// Windows' software encoder, and recording is scaled down to keep the CPU free.
+pub fn hardware_encoder() -> bool {
+    static FOUND: OnceLock<bool> = OnceLock::new();
+    *FOUND.get_or_init(|| {
+        if software_only() {
+            return false;
+        }
+        let output = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_H264,
+        };
+        let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        unsafe {
+            let found = MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                None,
+                Some(&output),
+                &mut list,
+                &mut count,
+            )
+            .is_ok();
+            for i in 0..count as usize {
+                drop(std::ptr::read(list.add(i)));
+            }
+            if !list.is_null() {
+                CoTaskMemFree(Some(list as _));
+            }
+            found && count > 0
+        }
+    })
+}
+
 /// Names of the GPUs that can capture and encode, for the settings window.
 pub fn adapters() -> Vec<String> {
     hardware_adapters().iter().map(adapter_name).collect()
 }
 
-/// The GPU a monitor is plugged into. Capturing with any other GPU makes Windows copy every
-/// frame between cards, which caps capture at about 30 fps on hybrid laptops.
-pub fn adapter_of(monitor: HMONITOR) -> Option<String> {
-    hardware_adapters().into_iter().find_map(|a| {
-        let drives = (0..)
-            .map_while(|i| unsafe { a.EnumOutputs(i) }.ok())
-            .any(|o| unsafe { o.GetDesc() }.is_ok_and(|d| d.Monitor == monitor));
-        drives.then(|| adapter_name(&a))
-    })
+/// The most power-efficient GPU: the integrated one on a PC with two. Recording with it lets a
+/// dedicated GPU sleep: an encode session holds a laptop's NVIDIA card at full clocks even on an
+/// idle desktop (4 W to 14 W measured on an RTX 3050), while a game running there keeps it awake
+/// anyway. Windows copies the other card's monitors over at the full frame rate.
+pub fn power_saving_adapter() -> Option<String> {
+    let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory6>() }.ok()?;
+    let adapter: IDXGIAdapter1 =
+        unsafe { factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_MINIMUM_POWER) }.ok()?;
+    let desc = unsafe { adapter.GetDesc1() }.ok()?;
+    (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0).then(|| adapter_name(&adapter))
 }
 
 impl Gpu {
@@ -100,26 +150,55 @@ impl Gpu {
             .into_iter()
             .find(|a| !preferred.is_empty() && adapter_name(a) == preferred)
             .and_then(|a| a.cast::<IDXGIAdapter>().ok());
-        let (mut device, mut ctx) = (None, None);
-        unsafe {
-            D3D11CreateDevice(
+        let create = |adapter: Option<&IDXGIAdapter>,
+                      kind,
+                      flags|
+         -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+            let (mut device, mut ctx) = (None, None);
+            unsafe {
+                D3D11CreateDevice(
+                    adapter,
+                    kind,
+                    Default::default(),
+                    flags,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut ctx),
+                )?;
+            }
+            Ok((device.unwrap(), ctx.unwrap()))
+        };
+        let kind = if adapter.is_some() {
+            D3D_DRIVER_TYPE_UNKNOWN
+        } else {
+            D3D_DRIVER_TYPE_HARDWARE
+        };
+        // Video support lets Media Foundation convert and encode straight from GPU textures.
+        let hardware = if software_only() {
+            Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                0x887A0004_u32 as i32,
+            )))
+        } else {
+            create(
                 adapter.as_ref(),
-                if adapter.is_some() {
-                    D3D_DRIVER_TYPE_UNKNOWN
-                } else {
-                    D3D_DRIVER_TYPE_HARDWARE
-                },
-                Default::default(),
-                // Video support lets Media Foundation convert and encode straight from GPU textures.
+                kind,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut ctx),
-            )?;
-        }
-        let (device, ctx) = (device.unwrap(), ctx.unwrap());
+            )
+        };
+        let software = hardware.is_err();
+        let (device, ctx) = match hardware {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Virtual machines, remote sessions and broken drivers: Windows' software
+                // rasterizer still captures the screen, just with more CPU.
+                crate::log(&format!(
+                    "no hardware GPU ({e}); capturing with the software renderer"
+                ));
+                create(None, D3D_DRIVER_TYPE_WARP, D3D11_CREATE_DEVICE_BGRA_SUPPORT)?
+            }
+        };
         unsafe {
             let _ = device
                 .cast::<ID3D11Multithread>()?
@@ -129,11 +208,9 @@ impl Gpu {
             let manager = manager.unwrap();
             manager.ResetDevice(&device, token)?;
             let dxgi = device.cast::<IDXGIDevice>()?;
-            let name = dxgi
-                .GetAdapter()?
-                .cast::<IDXGIAdapter1>()
-                .map(|a| adapter_name(&a))
-                .unwrap_or_default();
+            let adapter = dxgi.GetAdapter()?.cast::<IDXGIAdapter1>()?;
+            let name = adapter_name(&adapter);
+            let vendor = adapter.GetDesc1().map(|d| d.VendorId).unwrap_or_default();
             let winrt = CreateDirect3D11DeviceFromDXGIDevice(&dxgi)?.cast()?;
             Ok(Self {
                 device,
@@ -141,6 +218,8 @@ impl Gpu {
                 manager,
                 winrt,
                 name,
+                vendor,
+                software,
             })
         }
     }
@@ -150,13 +229,14 @@ impl Gpu {
 pub struct Session {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
-    closed: Arc<AtomicBool>,
+    stale: Arc<AtomicBool>,
 }
 
 impl Session {
-    /// True once Windows ended the capture (monitor unplugged, resolution change, ...).
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+    /// True once this session no longer matches the monitor: Windows ended it (unplugged,
+    /// sleep) or the resolution changed, as when a game switches the display mode.
+    pub fn is_stale(&self) -> bool {
+        self.stale.load(Ordering::Acquire)
     }
 }
 
@@ -223,6 +303,19 @@ pub fn monitors() -> Vec<MonitorInfo> {
     list
 }
 
+/// The monitor's current resolution in physical pixels, from the window manager. Cheap enough
+/// to poll; a game in exclusive full screen that switches the display mode changes it without
+/// telling a running capture session, which then only sees a stale, dark desktop.
+pub fn monitor_pixels(monitor: HMONITOR) -> Option<(u32, u32)> {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetMonitorInfoW(monitor, &mut info) }.ok().ok()?;
+    let r = info.rcMonitor;
+    Some(((r.right - r.left) as u32, (r.bottom - r.top) as u32))
+}
+
 /// The monitor's resolution in physical pixels, as capture will deliver it.
 pub fn monitor_size(monitor: HMONITOR) -> Result<(u32, u32)> {
     let size = item(monitor)?.Size()?;
@@ -235,6 +328,7 @@ pub fn start(
     gpu: &Gpu,
     monitor: HMONITOR,
     cursor: bool,
+    fps: Option<u32>,
     on_frame: impl Fn(&ID3D11Texture2D, i64) + Send + 'static,
 ) -> Result<Session> {
     let item = item(monitor)?;
@@ -248,15 +342,29 @@ pub fn start(
     let session = pool.CreateCaptureSession(&item)?;
     let _ = session.SetIsBorderRequired(false);
     let _ = session.SetIsCursorCaptureEnabled(cursor);
-    let closed = Arc::new(AtomicBool::new(false));
-    let flag = closed.clone();
+    if let Some(fps) = fps {
+        // A 144 Hz screen would otherwise wake us 144 times a second for a 60 fps recording.
+        // Three quarters of a frame keeps 60 fps content that lands on uneven refresh ticks.
+        // Windows 11 24H2+; older versions ignore it.
+        let interval = Duration::from_micros(750_000 / fps as u64);
+        let _ = session.SetMinUpdateInterval(interval.into());
+    }
+    let stale = Arc::new(AtomicBool::new(false));
+    let flag = stale.clone();
     item.Closed(&TypedEventHandler::new(move |_, _| {
         flag.store(true, Ordering::Release);
         Ok(())
     }))?;
+    let flag = stale.clone();
     pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, _>::new(
         move |pool, _| {
             let frame = pool.ok()?.TryGetNextFrame()?;
+            if frame.ContentSize()? != size {
+                // The display mode changed: these frames no longer fit the pool or the
+                // encoder. Drop them until the session is rebuilt at the new size.
+                flag.store(true, Ordering::Release);
+                return Ok(());
+            }
             let ts = frame.SystemRelativeTime()?.Duration;
             let tex: ID3D11Texture2D = unsafe {
                 frame
@@ -272,7 +380,7 @@ pub fn start(
     Ok(Session {
         pool,
         session,
-        closed,
+        stale,
     })
 }
 
@@ -285,7 +393,7 @@ pub fn screenshot(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::sync_channel::<ID3D11Texture2D>(1);
     let tx = std::sync::Mutex::new(Some(tx));
-    let _session = start(gpu, monitor, false, move |tex, _| {
+    let _session = start(gpu, monitor, false, None, move |tex, _| {
         if let Some(tx) = tx.lock().unwrap().take() {
             let _ = tx.send(tex.clone());
         }

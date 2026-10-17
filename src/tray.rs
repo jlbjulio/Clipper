@@ -6,15 +6,14 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_ERROR, NIIF_LARGE_ICON,
-    NIIF_NOSOUND, NIIF_USER, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4,
-    NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
+    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetCursorPos,
     GetSystemMetrics, HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LoadIconW, LoadImageW,
     MF_GRAYED, MF_SEPARATOR, MF_STRING, PostMessageW, RegisterClassW, RegisterWindowMessageW,
-    SM_CXICON, SM_CXSMICON, SetForegroundWindow, SetWindowTextW, TPM_BOTTOMALIGN, TPM_RETURNCMD,
+    SM_CXSMICON, SetForegroundWindow, SetWindowTextW, TPM_BOTTOMALIGN, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WNDCLASSW,
 };
 
@@ -64,7 +63,6 @@ pub struct Tray {
     pub hwnd: HWND,
     data: NOTIFYICONDATAW,
     icons: [HICON; 2],
-    big: HICON,
 }
 
 fn icon(id: u16, size_metric: i32) -> HICON {
@@ -72,7 +70,7 @@ fn icon(id: u16, size_metric: i32) -> HICON {
         let size = GetSystemMetrics(size_metric);
         let h = LoadImageW(
             GetModuleHandleW(null_mut()),
-            id as usize as *const u16,
+            std::ptr::without_provenance::<u16>(id as usize),
             IMAGE_ICON,
             size,
             size,
@@ -150,7 +148,6 @@ impl Tray {
                 hwnd,
                 data,
                 icons: [icon(1, SM_CXSMICON), icon(2, SM_CXSMICON)],
-                big: icon(1, SM_CXICON),
             };
             tray.add();
             tray
@@ -175,22 +172,6 @@ impl Tray {
         self.data.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         self.data.hIcon = self.icons[if recording { 0 } else { 1 }];
         copy(&mut self.data.szTip, tip);
-        unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.data) };
-    }
-
-    /// A Windows notification from the tray icon. Windows suppresses it during Focus Assist and
-    /// full-screen games, which is why the sound is a separate option.
-    pub fn notify(&mut self, title: &str, body: &str, error: bool) {
-        self.data.uFlags = NIF_INFO;
-        copy(&mut self.data.szInfoTitle, title);
-        copy(&mut self.data.szInfo, body);
-        self.data.dwInfoFlags = NIIF_NOSOUND
-            | if error {
-                NIIF_ERROR
-            } else {
-                NIIF_USER | NIIF_LARGE_ICON
-            };
-        self.data.hBalloonIcon = self.big;
         unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.data) };
     }
 
