@@ -1,29 +1,60 @@
 use std::path::Path;
 
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ,
-    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::{HSTRING, Interface, Result};
 
+use crate::amf::AmfEnc;
 use crate::audio::RATE;
 use crate::capture::Gpu;
 use crate::log;
-use crate::nvenc::NvEnc;
+use crate::nvenc::{NvEnc, Packet};
 
 const AUDIO_BYTES_PER_SEC: u32 = 20_000; // 160 kbps AAC
 const NVIDIA: u32 = 0x10DE;
+const AMD: u32 = 0x1002;
+
+/// A GPU vendor's encoder driven through its own driver API.
+enum Direct {
+    Nvenc(NvEnc),
+    Amf(AmfEnc),
+}
+
+impl Direct {
+    fn encode(
+        &mut self,
+        gpu: &Gpu,
+        src: &ID3D11Texture2D,
+        time: i64,
+    ) -> std::result::Result<Packet, String> {
+        match self {
+            Direct::Nvenc(e) => e.encode(gpu, src, time),
+            Direct::Amf(e) => e.encode(gpu, src, time),
+        }
+    }
+}
+
+/// When a direct encoder last failed mid-recording. For a minute after that, new segments use
+/// the Media Foundation encoder; then the direct one gets another chance, since most failures
+/// (a display mode change, a driver reset) pass.
+static DIRECT_FAILED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+const DIRECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Who turns frames into H.264.
 enum Video {
     /// The Media Foundation encoder inside the sink writer, fed from a pool of GPU textures.
-    /// Used for AMD and Intel, whose encoders are cheap in this form.
+    /// Used for Intel, and for NVIDIA or AMD when their own API is unavailable.
     Writer(IMFVideoSampleAllocatorEx),
-    /// NVENC driven directly; the sink writer only stores the packets it produces.
-    Nvenc(NvEnc),
+    /// NVENC or AMF driven directly; the sink writer only stores the packets they produce.
+    /// About half the CPU of the Media Foundation path for the same encoder.
+    Direct(Direct),
+    /// A direct encoder that failed: the rest of this segment has no new video rather than
+    /// stalling every frame (and the audio behind the same lock) on a stuck driver.
+    Retired,
     /// No usable GPU: frames are read back to system memory for a CPU-side encoder.
     Cpu(ID3D11Texture2D),
 }
@@ -118,14 +149,23 @@ fn memory_sample(bytes: &[u8], time: i64, duration: i64) -> Result<IMFSample> {
     }
 }
 
-/// Direct NVENC for NVIDIA cards, with the SPS/PPS the MP4 header needs. `None` means "use the
-/// Media Foundation encoder", which also covers any NVENC failure.
-fn nvenc(gpu: &Gpu, width: u32, height: u32, fps: u32, bitrate: u32) -> Option<(NvEnc, Vec<u8>)> {
-    if gpu.vendor != NVIDIA {
+/// NVENC for NVIDIA cards or AMF for AMD ones, with the SPS/PPS the MP4 header needs. `None`
+/// means "use the Media Foundation encoder", which also covers any failure of either.
+fn direct(gpu: &Gpu, width: u32, height: u32, fps: u32, bitrate: u32) -> Option<(Direct, Vec<u8>)> {
+    if DIRECT_FAILED
+        .lock()
+        .unwrap()
+        .is_some_and(|at| at.elapsed() < DIRECT_BACKOFF)
+    {
         return None;
     }
-    let started = NvEnc::new(gpu, width, height, fps, bitrate)
-        .and_then(|enc| enc.sequence_header().map(|header| (enc, header)));
+    let started = match gpu.vendor {
+        NVIDIA => NvEnc::new(gpu, width, height, fps, bitrate)
+            .and_then(|enc| enc.sequence_header().map(|h| (Direct::Nvenc(enc), h))),
+        AMD => AmfEnc::new(gpu, width, height, fps, bitrate)
+            .and_then(|enc| enc.sequence_header().map(|h| (Direct::Amf(enc), h))),
+        _ => return None,
+    };
     match started {
         Ok(ready) => Some(ready),
         Err(e) => {
@@ -163,13 +203,13 @@ impl Encoder {
             let out = video_type(&MFVideoFormat_H264, width, height, fps)?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
             out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
-            let (video, encoder) = match nvenc(gpu, width, height, fps, bitrate) {
+            let (video, encoder) = match direct(gpu, width, height, fps, bitrate) {
                 Some((enc, header)) => {
                     // Same type in and out: the writer stores the packets as they are.
                     out.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &header)?;
                     let video = writer.AddStream(&out)?;
                     writer.SetInputMediaType(video, &out, None)?;
-                    (video, Video::Nvenc(enc))
+                    (video, Video::Direct(enc))
                 }
                 None if gpu.software => {
                     let video = writer.AddStream(&out)?;
@@ -222,16 +262,25 @@ impl Encoder {
     /// Foundation encoder, drops the frame when it still holds every pooled texture.
     pub fn video(&mut self, gpu: &Gpu, src: &ID3D11Texture2D, time: i64) -> Result<()> {
         let pool = match &mut self.encoder {
-            Video::Nvenc(enc) => {
-                let packet = enc
-                    .encode(gpu, src, time)
-                    .map_err(|e| windows::core::Error::new(E_FAIL, e))?;
-                let sample = memory_sample(&packet.data, time, self.frame)?;
+            Video::Direct(enc) => {
+                let packet = match enc.encode(gpu, src, time) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log(&format!(
+                            "{e}; using the Media Foundation encoder for the next minute"
+                        ));
+                        *DIRECT_FAILED.lock().unwrap() = Some(std::time::Instant::now());
+                        self.encoder = Video::Retired;
+                        return Err(windows::core::Error::new(E_FAIL, e));
+                    }
+                };
+                let sample = memory_sample(&packet.data, packet.time, self.frame)?;
                 unsafe {
                     sample.SetUINT32(&MFSampleExtension_CleanPoint, packet.keyframe as u32)?;
                     return self.writer.WriteSample(self.video, &sample);
                 }
             }
+            Video::Retired => return Ok(()),
             Video::Cpu(staging) => {
                 let pixels = read_back(gpu, staging, src, self.width, self.height)?;
                 let sample = memory_sample(&pixels, time, self.frame)?;
@@ -249,23 +298,13 @@ impl Encoder {
             let dxgi: IMFDXGIBuffer = buffer.cast()?;
             let mut dst: Option<ID3D11Texture2D> = None;
             dxgi.GetResource(&ID3D11Texture2D::IID, &mut dst as *mut _ as _)?;
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            src.GetDesc(&mut desc);
-            let area = D3D11_BOX {
-                right: desc.Width.min(self.width),
-                bottom: desc.Height.min(self.height),
-                back: 1,
-                ..Default::default()
-            };
-            gpu.ctx.CopySubresourceRegion(
+            crate::capture::copy_picture(
+                gpu,
                 &dst.unwrap(),
                 dxgi.GetSubresourceIndex()?,
-                0,
-                0,
-                0,
                 src,
-                0,
-                Some(&area),
+                self.width,
+                self.height,
             );
             buffer.SetCurrentLength(buffer.GetMaxLength()?)?;
             sample.SetSampleTime(time)?;
@@ -326,14 +365,7 @@ fn read_back(
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         src.GetDesc(&mut desc);
         let (w, h) = (desc.Width.min(width), desc.Height.min(height));
-        let area = D3D11_BOX {
-            right: w,
-            bottom: h,
-            back: 1,
-            ..Default::default()
-        };
-        gpu.ctx
-            .CopySubresourceRegion(staging, 0, 0, 0, 0, src, 0, Some(&area));
+        crate::capture::copy_picture(gpu, staging, 0, src, width, height);
         let mut map = D3D11_MAPPED_SUBRESOURCE::default();
         gpu.ctx.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut map))?;
         for y in 0..h as usize {

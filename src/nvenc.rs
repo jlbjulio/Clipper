@@ -11,11 +11,7 @@ use std::ptr::null_mut;
 use std::sync::OnceLock;
 
 use moq_nvenc::sys::nvEncodeAPI::*;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, ID3D11Texture2D,
-};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::core::{Interface, s, w};
 
@@ -98,10 +94,11 @@ pub struct NvEnc {
 // recorder serializes them behind its mutex.
 unsafe impl Send for NvEnc {}
 
-/// One encoded frame in Annex B form.
+/// One encoded frame in Annex B form, with its time in 100 ns units from the segment start.
 pub struct Packet {
     pub data: Vec<u8>,
     pub keyframe: bool,
+    pub time: i64,
 }
 
 const TUNING: NV_ENC_TUNING_INFO = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LATENCY;
@@ -109,7 +106,7 @@ const TUNING: NV_ENC_TUNING_INFO = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOW_LA
 impl NvEnc {
     pub fn new(gpu: &Gpu, width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
         let api = api().ok_or("no NVIDIA encoder driver")?;
-        let input = texture(gpu, width, height)?;
+        let input = crate::capture::bgra_texture(gpu, width, height)?;
         let mut session = null_mut();
         unsafe {
             let mut open = Zeroed::<NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS>::new();
@@ -258,17 +255,8 @@ impl NvEnc {
     /// Encodes `src` and returns the frame, waiting for the GPU (a few milliseconds at 1080p).
     pub fn encode(&mut self, gpu: &Gpu, src: &ID3D11Texture2D, time: i64) -> Result<Packet> {
         let api = self.api;
+        crate::capture::copy_picture(gpu, &self.input, 0, src, self.width, self.height);
         unsafe {
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            src.GetDesc(&mut desc);
-            let area = D3D11_BOX {
-                right: desc.Width.min(self.width),
-                bottom: desc.Height.min(self.height),
-                back: 1,
-                ..Default::default()
-            };
-            gpu.ctx
-                .CopySubresourceRegion(&self.input, 0, 0, 0, 0, src, 0, Some(&area));
             // Submit the copy now; otherwise NVENC waits for the queue to flush on its own.
             gpu.ctx.Flush();
 
@@ -295,13 +283,13 @@ impl NvEnc {
             (*p).pictureStruct = NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME;
             self.frame = self.frame.wrapping_add(1);
             let result = check("encode", call!(api, nvEncEncodePicture)(self.session, p))
-                .and_then(|()| self.read_packet());
+                .and_then(|()| self.read_packet(time));
             call!(api, nvEncUnmapInputResource)(self.session, mapped);
             result
         }
     }
 
-    fn read_packet(&mut self) -> Result<Packet> {
+    fn read_packet(&mut self, time: i64) -> Result<Packet> {
         let api = self.api;
         unsafe {
             let mut lock = Zeroed::<NV_ENC_LOCK_BITSTREAM>::new();
@@ -319,7 +307,11 @@ impl NvEnc {
             .to_vec();
             let keyframe = (*l).pictureType == NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR;
             call!(api, nvEncUnlockBitstream)(self.session, self.bitstream);
-            Ok(Packet { data, keyframe })
+            Ok(Packet {
+                data,
+                keyframe,
+                time,
+            })
         }
     }
 }
@@ -343,26 +335,4 @@ impl Drop for NvEnc {
             }
         }
     }
-}
-
-fn texture(gpu: &Gpu, width: u32, height: u32) -> Result<ID3D11Texture2D> {
-    let desc = D3D11_TEXTURE2D_DESC {
-        Width: width,
-        Height: height,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-        CPUAccessFlags: 0,
-        MiscFlags: 0,
-    };
-    let mut tex = None;
-    unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
-        .map_err(|e| e.to_string())?;
-    tex.ok_or_else(|| "texture creation returned nothing".to_string())
 }

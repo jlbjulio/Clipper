@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod amf;
 mod app;
 mod audio;
 mod capture;

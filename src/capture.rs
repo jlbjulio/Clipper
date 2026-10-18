@@ -15,11 +15,13 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
     ID3D11Texture2D,
 };
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_GPU_PREFERENCE_MINIMUM_POWER,
     IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIFactory6,
@@ -329,6 +331,66 @@ pub fn monitor_pixels(monitor: HMONITOR) -> Option<(u32, u32)> {
     Some(((r.right - r.left) as u32, (r.bottom - r.top) as u32))
 }
 
+/// The shortest gap Windows may leave between delivered frames for an `fps` recording, in
+/// microseconds: half a frame, the recorder's own tolerance for an early frame. Longer gaps
+/// lose frames whenever the source's pace and the gap don't line up: three quarters of a frame
+/// recorded 165 Hz screens at 55 fps, and rules built on refresh ticks halve games under G-Sync
+/// or FreeSync. Shorter gaps only deliver frames the recorder drops anyway.
+fn min_interval_us(fps: u32) -> u64 {
+    500_000 / fps.max(1) as u64
+}
+
+/// A BGRA texture an encoder reads from; captured pictures are copied into it.
+pub fn bgra_texture(
+    gpu: &Gpu,
+    width: u32,
+    height: u32,
+) -> std::result::Result<ID3D11Texture2D, String> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut tex = None;
+    unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+        .map_err(|e| e.to_string())?;
+    tex.ok_or_else(|| "texture creation returned nothing".to_string())
+}
+
+/// Copies the `width` x `height` picture in the top-left corner of `src` into `dst`, GPU to
+/// GPU. Capture frames can be larger than the picture (a window's invisible borders).
+pub fn copy_picture(
+    gpu: &Gpu,
+    dst: &ID3D11Texture2D,
+    dst_subresource: u32,
+    src: &ID3D11Texture2D,
+    width: u32,
+    height: u32,
+) {
+    unsafe {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        src.GetDesc(&mut desc);
+        let area = D3D11_BOX {
+            right: desc.Width.min(width),
+            bottom: desc.Height.min(height),
+            back: 1,
+            ..Default::default()
+        };
+        gpu.ctx
+            .CopySubresourceRegion(dst, dst_subresource, 0, 0, 0, src, 0, Some(&area));
+    }
+}
+
 /// The source's size in physical pixels, as capture will deliver it.
 pub fn source_size(source: Source) -> Result<(u32, u32)> {
     let size = item(source)?.Size()?;
@@ -361,10 +423,10 @@ pub fn start(
     let _ = session.SetIsBorderRequired(false);
     let _ = session.SetIsCursorCaptureEnabled(cursor);
     if let Some(fps) = fps {
-        // A 144 Hz screen would otherwise wake us 144 times a second for a 60 fps recording.
-        // Three quarters of a frame keeps 60 fps content that lands on uneven refresh ticks.
+        // A 144 Hz screen would otherwise wake us 144 times a second for a 60 fps recording;
+        // every frame Windows delivers costs a copy even if the recorder then skips it.
         // Windows 11 24H2+; older versions ignore it.
-        let interval = Duration::from_micros(750_000 / fps as u64);
+        let interval = Duration::from_micros(min_interval_us(fps));
         let _ = session.SetMinUpdateInterval(interval.into());
     }
     let stale = Arc::new(AtomicBool::new(false));
@@ -491,4 +553,18 @@ fn write_png(path: &Path, pixels: &[u8], w: u32, h: u32) -> Result<()> {
         encoder.Commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::min_interval_us;
+
+    #[test]
+    fn capture_interval_is_half_a_frame() {
+        assert_eq!(min_interval_us(60), 8_333);
+        assert_eq!(min_interval_us(30), 16_666);
+        // Frames 1/165 s apart (6.06 ms) pass at every second tick: 82 a second for 60 kept.
+        let tick_165 = 1_000_000 / 165;
+        assert!(2 * tick_165 >= min_interval_us(60) && 2 * tick_165 <= 1_000_000 / 60);
+    }
 }
