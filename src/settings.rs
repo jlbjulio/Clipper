@@ -1204,6 +1204,9 @@ fn style(ctx: &egui::Context, accent: Accent) {
             s.visuals.extreme_bg_color = p.window;
             s.visuals.selection.bg_fill = p.accent;
             s.visuals.selection.stroke = Stroke::new(1.0_f32, p.on_accent);
+            // The software backend redraws at once for every repaint request, so a blinking
+            // cursor in the bitrate field would redraw the window nonstop.
+            s.visuals.text_cursor.blink = false;
             s.visuals.widgets.noninteractive.fg_stroke.color = p.text;
             s.visuals.widgets.noninteractive.bg_stroke.color = p.border;
             let widgets = &mut s.visuals.widgets;

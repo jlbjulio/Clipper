@@ -24,16 +24,31 @@ enum Direct {
     Amf(AmfEnc),
 }
 
+type Packets = std::result::Result<Vec<Packet>, String>;
+
 impl Direct {
-    fn encode(
-        &mut self,
-        gpu: &Gpu,
-        src: &ID3D11Texture2D,
-        time: i64,
-    ) -> std::result::Result<Packet, String> {
+    /// The packets ready after queuing `src`. NVENC finishes each frame before returning; AMF
+    /// returns at once with whatever earlier frames have finished.
+    fn encode(&mut self, gpu: &Gpu, src: &ID3D11Texture2D, time: i64) -> Packets {
         match self {
-            Direct::Nvenc(e) => e.encode(gpu, src, time),
+            Direct::Nvenc(e) => e.encode(gpu, src, time).map(|p| vec![p]),
             Direct::Amf(e) => e.encode(gpu, src, time),
+        }
+    }
+
+    /// Packets that finished since the last call, without waiting.
+    fn collect(&mut self) -> Packets {
+        match self {
+            Direct::Nvenc(_) => Ok(Vec::new()),
+            Direct::Amf(e) => e.collect(),
+        }
+    }
+
+    /// Every packet still in the encoder, waiting for them.
+    fn drain(&mut self) -> Packets {
+        match self {
+            Direct::Nvenc(_) => Ok(Vec::new()),
+            Direct::Amf(e) => e.drain(),
         }
     }
 }
@@ -263,22 +278,8 @@ impl Encoder {
     pub fn video(&mut self, gpu: &Gpu, src: &ID3D11Texture2D, time: i64) -> Result<()> {
         let pool = match &mut self.encoder {
             Video::Direct(enc) => {
-                let packet = match enc.encode(gpu, src, time) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log(&format!(
-                            "{e}; using the Media Foundation encoder for the next minute"
-                        ));
-                        *DIRECT_FAILED.lock().unwrap() = Some(std::time::Instant::now());
-                        self.encoder = Video::Retired;
-                        return Err(windows::core::Error::new(E_FAIL, e));
-                    }
-                };
-                let sample = memory_sample(&packet.data, packet.time, self.frame)?;
-                unsafe {
-                    sample.SetUINT32(&MFSampleExtension_CleanPoint, packet.keyframe as u32)?;
-                    return self.writer.WriteSample(self.video, &sample);
-                }
+                let packets = enc.encode(gpu, src, time);
+                return self.write_packets(packets);
             }
             Video::Retired => return Ok(()),
             Video::Cpu(staging) => {
@@ -313,6 +314,39 @@ impl Encoder {
         }
     }
 
+    /// Stores packets from a direct encoder. On an error the encoder is retired for the rest of
+    /// the segment and new segments use Media Foundation for a minute.
+    fn write_packets(&mut self, packets: Packets) -> Result<()> {
+        let packets = packets.map_err(|e| {
+            log(&format!(
+                "{e}; using the Media Foundation encoder for the next minute"
+            ));
+            *DIRECT_FAILED.lock().unwrap() = Some(std::time::Instant::now());
+            self.encoder = Video::Retired;
+            windows::core::Error::new(E_FAIL, e)
+        })?;
+        for packet in packets {
+            let sample = memory_sample(&packet.data, packet.time, self.frame)?;
+            unsafe {
+                sample.SetUINT32(&MFSampleExtension_CleanPoint, packet.keyframe as u32)?;
+                self.writer.WriteSample(self.video, &sample)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores the frames a direct encoder finished since the last frame went in. Called
+    /// regularly, so packets reach the file even while the screen is static.
+    pub fn collect(&mut self) -> Result<()> {
+        match &mut self.encoder {
+            Video::Direct(enc) => {
+                let packets = enc.collect();
+                self.write_packets(packets)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Queues 16-bit stereo PCM starting at `time` (100 ns units from the segment start).
     pub fn audio(&self, pcm: &[u8], time: i64) -> Result<()> {
         let sample = memory_sample(pcm, time, pcm.len() as i64 / 4 * 10_000_000 / RATE as i64)?;
@@ -326,7 +360,12 @@ impl Encoder {
     }
 
     /// Flushes the encoder and writes the MP4 index.
-    pub fn finish(self) -> Result<()> {
+    pub fn finish(mut self) -> Result<()> {
+        if let Video::Direct(enc) = &mut self.encoder {
+            let packets = enc.drain();
+            // A stuck encoder only loses this segment's last frames; the file still closes.
+            let _ = self.write_packets(packets);
+        }
         unsafe { self.writer.Finalize() }
     }
 }

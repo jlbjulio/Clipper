@@ -28,14 +28,16 @@ type Result<T> = std::result::Result<T, String>;
 const AMF_OK: i32 = 0;
 const AMF_EOF: i32 = 23;
 const AMF_REPEAT: i32 = 24;
+const AMF_INPUT_FULL: i32 = 25;
 const AMF_NEED_MORE_INPUT: i32 = 44;
 
 /// The SDK version these bindings were written and checked against (core/Version.h).
 const SDK_VERSION: u64 = 1 << 48 | 5 << 32 | 3 << 16;
-/// Input textures in rotation: the next copy never lands in a frame the encoder may still be
-/// reading.
-const INPUTS: usize = 3;
-/// How long one frame may take before the encoder counts as stuck (a frame takes a few ms).
+/// Input textures in rotation, so the encoder can work on a few frames while capture goes on.
+/// A texture is reused only once its frame's packet came out.
+const INPUTS: usize = 4;
+/// How long the encoder may go without producing a packet before it counts as stuck (a frame
+/// takes a few ms).
 const STUCK: Duration = Duration::from_secs(1);
 
 const AMF_DX11_0: i32 = 110;
@@ -230,6 +232,10 @@ pub struct AmfEnc {
     encoder: *mut Object,
     inputs: Vec<Input>,
     next: usize,
+    /// Frames submitted whose packet has not come out yet.
+    in_flight: usize,
+    /// When the encoder last made progress: a packet came out, or it got work while idle.
+    progress: Instant,
     width: u32,
     height: u32,
 }
@@ -251,6 +257,8 @@ impl AmfEnc {
                 encoder: null_mut(),
                 inputs: Vec::new(),
                 next: 0,
+                in_flight: 0,
+                progress: Instant::now(),
                 width,
                 height,
             };
@@ -354,31 +362,64 @@ impl AmfEnc {
         }
     }
 
-    /// Encodes `src` and returns its packet, waiting for the GPU (a few milliseconds at 1080p).
-    /// Low-latency usage gives one output per input, so a full queue or a missing output
-    /// means the encoder is broken: the error makes the recorder stop using it.
-    pub fn encode(&mut self, gpu: &Gpu, src: &ID3D11Texture2D, time: i64) -> Result<Packet> {
+    /// Starts encoding `src` and returns the packets of earlier frames that are ready, without
+    /// waiting for the GPU: the capture thread never blocks on it. When the encoder still holds
+    /// every input texture, the frame is dropped, so a GPU busy with the game records fewer
+    /// frames instead of stalling. An encoder that makes no progress for a second is broken:
+    /// the error makes the recorder stop using it.
+    pub fn encode(&mut self, gpu: &Gpu, src: &ID3D11Texture2D, time: i64) -> Result<Vec<Packet>> {
+        let mut packets = self.collect()?;
+        if self.in_flight > 0 && self.progress.elapsed() >= STUCK {
+            return Err("AMF encoder produced no frame within 1 s".into());
+        }
+        if self.in_flight == INPUTS {
+            return Ok(packets);
+        }
         let input = &self.inputs[self.next];
-        self.next = (self.next + 1) % INPUTS;
         copy_picture(gpu, &input.texture, 0, src, self.width, self.height);
         unsafe {
             // Submit the copy now, so the encoder does not wait for the queue to flush.
             gpu.ctx.Flush();
             (vt::<DataVtbl>(input.surface).set_pts)(input.surface, time);
             let e = vt::<ComponentVtbl>(self.encoder);
-            check("submit", (e.submit_input)(self.encoder, input.surface))?;
-        }
-        let deadline = Instant::now() + STUCK;
-        loop {
-            if let Some(packet) = self.poll()? {
-                return Ok(packet);
+            match (e.submit_input)(self.encoder, input.surface) {
+                AMF_INPUT_FULL => return Ok(packets),
+                r => check("submit", r)?,
             }
-            if Instant::now() >= deadline {
+        }
+        if self.in_flight == 0 {
+            self.progress = Instant::now();
+        }
+        self.in_flight += 1;
+        self.next = (self.next + 1) % INPUTS;
+        packets.extend(self.collect()?);
+        Ok(packets)
+    }
+
+    /// The packets that are ready now.
+    pub fn collect(&mut self) -> Result<Vec<Packet>> {
+        let mut packets = Vec::new();
+        while let Some(packet) = self.poll()? {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            self.progress = Instant::now();
+            packets.push(packet);
+        }
+        Ok(packets)
+    }
+
+    /// Waits for the packets of every frame still in the encoder, at the end of a segment.
+    /// Low-latency usage gives one output per input, so no explicit drain is needed.
+    pub fn drain(&mut self) -> Result<Vec<Packet>> {
+        let mut packets = self.collect()?;
+        while self.in_flight > 0 {
+            if self.progress.elapsed() >= STUCK {
                 return Err("AMF encoder produced no frame within 1 s".into());
             }
             // A frame takes a few milliseconds; Rust's sleep uses a high-resolution timer.
             std::thread::sleep(Duration::from_millis(1));
+            packets.extend(self.collect()?);
         }
+        Ok(packets)
     }
 
     /// One output if the encoder has one ready. A returned object is always used and released,
@@ -480,5 +521,32 @@ mod tests {
         assert_eq!(size_of::<Variant>(), 24);
         assert_eq!(offset_of!(Variant, value), 8);
         assert_eq!(size_of::<Guid>(), 16);
+    }
+
+    /// The recorder makes a new encoder for every 10 s segment; 60 of them (10 minutes of
+    /// recording) must keep every frame and not leave memory behind. Needs an AMD GPU:
+    /// `cargo test --release churn -- --ignored --nocapture`, watching the process's memory.
+    #[test]
+    #[ignore]
+    fn churn() {
+        let gpu = Gpu::new("AMD Radeon(TM) Graphics").unwrap();
+        let src = bgra_texture(&gpu, 1920, 1080).unwrap();
+        for i in 0..60 {
+            let mut enc = AmfEnc::new(&gpu, 1920, 1080, 60, 16_000_000).unwrap();
+            enc.sequence_header().unwrap();
+            let mut packets = Vec::new();
+            for f in 0..60 {
+                packets.extend(enc.encode(&gpu, &src, f * 166_666).unwrap());
+                // Frames arrive at 60 fps, as from capture.
+                std::thread::sleep(Duration::from_micros(16_666));
+            }
+            packets.extend(enc.drain().unwrap());
+            // At 60 fps no frame is dropped; each comes out once, in order, a keyframe first.
+            assert_eq!(packets.len(), 60);
+            assert!(packets[0].keyframe);
+            assert!(packets.windows(2).all(|p| p[0].time < p[1].time));
+            drop(enc);
+            eprintln!("encoder {i}: {} packets", packets.len());
+        }
     }
 }

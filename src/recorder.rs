@@ -16,6 +16,9 @@ use crate::log;
 use crate::mp4;
 
 const SEG_SECS: i64 = 10;
+/// How long to wait before building an encoder again after one failed, so a broken driver
+/// costs one attempt a second instead of one per frame.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 /// `TimeSpan` units (100 ns) per second.
 pub const TICKS: i64 = 10_000_000;
 
@@ -92,6 +95,11 @@ pub struct Recorder {
     // Built shortly before a rotation so switching segments never stalls the capture thread.
     spare: Mutex<Option<Built>>,
     refilling: AtomicBool,
+    /// Bumped whenever the spare is thrown away, so one still being built for the old size,
+    /// GPU or settings is not kept.
+    generation: AtomicU64,
+    /// When building an encoder last failed.
+    build_failed: Mutex<Option<std::time::Instant>>,
     /// Off between `stop` and `run`: a frame still in flight from a closed capture session must
     /// not start a new segment.
     running: AtomicBool,
@@ -120,12 +128,24 @@ impl Recorder {
             active: Mutex::new(None),
             spare: Mutex::new(None),
             refilling: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            build_failed: Mutex::new(None),
             running: AtomicBool::new(false),
             jobs,
         })
     }
 
+    fn backing_off(&self) -> bool {
+        self.build_failed
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() < RETRY)
+    }
+
     fn new_encoder(&self) -> Result<Built, BoxError> {
+        if self.backing_off() {
+            return Err("the last encoder setup failed; retrying shortly".into());
+        }
         let gpu = self.gpu.lock().unwrap().clone();
         let path = self.dir.join(format!(
             "seg_{}.mp4",
@@ -144,22 +164,47 @@ impl Recorder {
         } else {
             p.quality.bitrate(w, h, p.fps)
         };
-        let enc = Encoder::new(&gpu, &path, w, h, p.fps, bitrate)?;
+        let enc = Encoder::new(&gpu, &path, w, h, p.fps, bitrate).inspect_err(|_| {
+            *self.build_failed.lock().unwrap() = Some(std::time::Instant::now());
+            // The sink writer may have created the file before a later step failed.
+            let _ = fs::remove_file(&path);
+        })?;
         Ok((gpu, enc, path, TICKS / p.fps as i64))
     }
 
+    /// Throws away the spare encoder, built for an old size, GPU or setting, along with any
+    /// spare still being built, and deletes its unused file.
+    fn discard_spare(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some((_, enc, path, _)) = self.spare.lock().unwrap().take() {
+            drop(enc);
+            let _ = fs::remove_file(path);
+        }
+    }
+
     fn refill_spare(self: &Arc<Self>) {
-        if self.spare.lock().unwrap().is_some() || self.refilling.swap(true, Ordering::AcqRel) {
+        if self.spare.lock().unwrap().is_some()
+            || self.backing_off()
+            || self.refilling.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let me = self.clone();
+        let generation = self.generation.load(Ordering::Acquire);
         thread::spawn(move || {
             match me.new_encoder() {
-                // Discard it if the GPU changed while it was being built.
-                Ok(e) if Arc::ptr_eq(&e.0, &me.gpu.lock().unwrap()) => {
-                    *me.spare.lock().unwrap() = Some(e)
+                Ok(e) => {
+                    let mut spare = me.spare.lock().unwrap();
+                    // Kept only if nothing changed the size, GPU or settings meanwhile.
+                    if me.generation.load(Ordering::Acquire) == generation {
+                        *spare = Some(e);
+                    } else {
+                        drop(spare);
+                        let (_, enc, path, _) = e;
+                        drop(enc);
+                        let _ = fs::remove_file(path);
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => log(&format!("encoder setup failed: {e}")),
             }
             me.refilling.store(false, Ordering::Release);
@@ -195,7 +240,7 @@ impl Recorder {
     /// a clip.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
-        drop(self.spare.lock().unwrap().take());
+        self.discard_spare();
         let old = self.active.lock().unwrap().take();
         self.finish(old);
     }
@@ -205,7 +250,7 @@ impl Recorder {
         let changed = std::mem::replace(&mut *self.size.lock().unwrap(), size) != size;
         if changed || self.active.lock().unwrap().is_none() {
             // A clip never spans two sizes: mp4::join keeps the run that covers most of it.
-            drop(self.spare.lock().unwrap().take());
+            self.discard_spare();
             self.cut();
         }
     }
@@ -216,7 +261,7 @@ impl Recorder {
             return;
         }
         *self.gpu.lock().unwrap() = gpu;
-        drop(self.spare.lock().unwrap().take());
+        self.discard_spare();
         if self.active.lock().unwrap().is_some() {
             self.cut();
         }
@@ -227,7 +272,7 @@ impl Recorder {
         self.clip_secs.store(p.clip_secs as u64, Ordering::Release);
         let changed = std::mem::replace(&mut *self.params.lock().unwrap(), p) != p;
         if changed && self.active.lock().unwrap().is_some() {
-            drop(self.spare.lock().unwrap().take());
+            self.discard_spare();
             self.cut();
         }
     }
@@ -284,6 +329,10 @@ impl Recorder {
         let mut guard = self.active.lock().unwrap();
         let Some(a) = guard.as_mut() else { return };
         let Some(first) = a.first else { return };
+        // Frames the encoder finished since the last one went in, before any gap is marked.
+        if let Err(e) = a.enc.collect() {
+            log(&format!("video encode failed: {e}"));
+        }
         let due = ((now - first).max(0) as i128 * RATE as i128 / TICKS as i128) as u64;
         if due <= a.audio_sent {
             return;

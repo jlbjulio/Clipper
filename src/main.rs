@@ -27,7 +27,21 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 static LOG: OnceLock<PathBuf> = OnceLock::new();
 
+/// Appends a line to the log. A message repeated within a second is skipped, so an error that
+/// recurs every frame costs one file write a second, not sixty.
 pub fn log(msg: &str) {
+    static LAST: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if let Some((text, at)) = &*last
+            && text == msg
+            && at.elapsed() < std::time::Duration::from_secs(1)
+        {
+            return;
+        }
+        *last = Some((msg.to_string(), std::time::Instant::now()));
+    }
     if let Some(path) = LOG.get()
         && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
     {
@@ -69,5 +83,6 @@ fn main() {
     let _ = LOG.set(log_path);
     // Release builds abort on panic; leave the reason in the log for bug reports.
     std::panic::set_hook(Box::new(|info| log(&format!("crash: {info}"))));
+    capture::yield_gpu();
     app::run();
 }

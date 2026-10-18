@@ -12,13 +12,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
     VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, PostMessageW, SetWindowsHookExW,
-    WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE, PeekMessageW,
+    PostMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::config::{Hotkey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
@@ -27,6 +29,8 @@ use crate::config::{Hotkey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
 static BINDINGS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static TARGET: AtomicUsize = AtomicUsize::new(0);
+/// The hook thread's id, for telling it to install or remove the hook.
+static THREAD: AtomicUsize = AtomicUsize::new(0);
 /// The shortcut being held (packed like a binding), so its auto-repeat and release are
 /// swallowed too.
 static HELD: AtomicU64 = AtomicU64::new(0);
@@ -119,18 +123,44 @@ unsafe extern "system" fn hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     }
 }
 
+/// True when some shortcut is handed to the hook and the hook is not paused.
+fn needed() -> bool {
+    ENABLED.load(Ordering::Relaxed) && BINDINGS.iter().any(|b| b.load(Ordering::Relaxed) != 0)
+}
+
 /// Starts the hook thread. Matching shortcuts arrive at `target` as `WM_HOTKEY` with
-/// `wParam` = 1, 2 or 3 (the position in `set`'s list, plus one).
+/// `wParam` = 1, 2 or 3 (the position in `set`'s list, plus one). The hook is installed only
+/// while a shortcut needs it: every key pressed anywhere, in a game too, goes through an
+/// installed low-level hook first.
 pub fn start(target: usize) {
     TARGET.store(target, Ordering::Relaxed);
     thread::spawn(|| unsafe {
-        if SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), std::ptr::null_mut(), 0).is_null() {
-            crate::log("keyboard hook unavailable; reserved shortcuts will not work");
-            return;
-        }
-        // A low-level hook only runs while its thread pumps messages.
         let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+        // Create the message queue before publishing the id, so no request is lost.
+        PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+        THREAD.store(GetCurrentThreadId() as usize, Ordering::Release);
+        let mut installed: HHOOK = std::ptr::null_mut();
+        loop {
+            match (needed(), installed.is_null()) {
+                (true, true) => {
+                    installed =
+                        SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), std::ptr::null_mut(), 0);
+                    if installed.is_null() {
+                        crate::log("keyboard hook unavailable; reserved shortcuts will not work");
+                    }
+                }
+                (false, false) => {
+                    UnhookWindowsHookEx(installed);
+                    installed = std::ptr::null_mut();
+                }
+                _ => {}
+            }
+            // A low-level hook only runs while its thread pumps messages; WM_APP asks for a
+            // fresh look at `needed()`.
+            if GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) <= 0 {
+                return;
+            }
+        }
     });
 }
 
@@ -146,4 +176,9 @@ pub fn set(keys: [Hotkey; 3], enabled: bool) {
         slot.store(packed, Ordering::Relaxed);
     }
     ENABLED.store(enabled, Ordering::Relaxed);
+    // Before the thread has started, it reads the bindings itself.
+    let thread = THREAD.load(Ordering::Acquire);
+    if thread != 0 {
+        unsafe { PostThreadMessageW(thread as u32, WM_APP, 0, 0) };
+    }
 }

@@ -39,12 +39,13 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::core::BOOL;
-use windows::core::{HSTRING, Interface, Result};
+use windows::core::{HSTRING, Interface, Result, s, w};
 
 /// One D3D11 device shared by capture and encoding, so frames never leave the GPU.
 pub struct Gpu {
@@ -223,6 +224,31 @@ impl Gpu {
                 vendor,
                 software,
             })
+        }
+    }
+}
+
+/// Lets the game and the desktop compositor go first on every GPU this process uses. On a
+/// laptop the game often renders on one GPU and its frames are shown through the other, the
+/// same one Clipper records with; at normal priority Clipper's copies and encoding delay the
+/// game's frames there.
+pub fn yield_gpu() {
+    // D3DKMT_SCHEDULINGPRIORITYCLASS_BELOW_NORMAL; any process may lower its own class.
+    const BELOW_NORMAL: i32 = 1;
+    unsafe {
+        let Ok(gdi) = LoadLibraryW(w!("gdi32.dll")) else {
+            return;
+        };
+        if let Some(f) = GetProcAddress(gdi, s!("D3DKMTSetProcessSchedulingPriorityClass")) {
+            let set: unsafe extern "system" fn(*mut std::ffi::c_void, i32) -> i32 =
+                std::mem::transmute(f);
+            let status = set(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                BELOW_NORMAL,
+            );
+            if status != 0 {
+                crate::log(&format!("GPU priority unchanged: {status:#x}"));
+            }
         }
     }
 }
@@ -416,7 +442,8 @@ pub fn start(
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &gpu.winrt,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        2,
+        // A spare buffer, so Windows can deliver the next frame while one is being copied.
+        3,
         size,
     )?;
     let session = pool.CreateCaptureSession(&item)?;

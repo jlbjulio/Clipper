@@ -19,9 +19,9 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DI_NORMAL, DefWindowProcW, DrawIconEx, GetSystemMetrics, HWND_TOPMOST,
-    IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, RegisterClassW, SM_CXICON, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow, ULW_ALPHA,
+    CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyIcon, DrawIconEx, GetSystemMetrics,
+    HWND_TOPMOST, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, RegisterClassW, SM_CXICON, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow, ULW_ALPHA,
     UpdateLayeredWindow, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -45,6 +45,8 @@ pub struct Overlay {
     pos: POINT,
     size: SIZE,
     shown: Option<Instant>,
+    /// The opacity last drawn, so the fully visible stretch is not redrawn 30 times a second.
+    alpha: u8,
 }
 
 impl Overlay {
@@ -83,6 +85,7 @@ impl Overlay {
                 pos: POINT { x: 0, y: 0 },
                 size: SIZE { cx: 0, cy: 0 },
                 shown: None,
+                alpha: 0,
             }
         }
     }
@@ -123,6 +126,7 @@ impl Overlay {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
+            self.alpha = 0;
             self.present(0);
         }
     }
@@ -145,7 +149,11 @@ impl Overlay {
             self.release();
             return false;
         };
-        self.present((alpha.clamp(0.0, 1.0) * 255.0) as u8);
+        let alpha = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
+        if alpha != self.alpha {
+            self.alpha = alpha;
+            self.present(alpha);
+        }
         true
     }
 
@@ -224,6 +232,7 @@ impl Overlay {
                     null_mut(),
                     DI_NORMAL,
                 );
+                DestroyIcon(icon as _);
             }
 
             SetBkMode(self.dc, TRANSPARENT as i32);

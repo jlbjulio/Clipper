@@ -141,7 +141,10 @@ pub fn spawn(mixer: Mixer) {
                 devices.extend(microphone(&host, &chosen).map(|d| (d, false)));
             }
             let ids: Vec<_> = devices.iter().map(|(d, _)| d.id().ok()).collect();
-            if ids != current || lost.swap(false, Ordering::AcqRel) {
+            // Read the flag every pass, so a loss that coincides with a device change does not
+            // trigger a second rebuild two seconds later.
+            let was_lost = lost.swap(false, Ordering::AcqRel);
+            if ids != current || was_lost {
                 streams.clear();
                 let mut queues = Vec::new();
                 for (dev, loopback) in &devices {
