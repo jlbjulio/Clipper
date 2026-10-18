@@ -109,14 +109,19 @@ fn tray_window() -> HWND {
     unsafe { FindWindowW(wide(tray::CLASS).as_ptr(), null_mut()) }
 }
 
-fn read_status() -> Option<Status> {
+/// The tray's status line (its hidden window's title), or None when the tray isn't running.
+fn tray_status_text() -> Option<String> {
     let hwnd = tray_window();
     if hwnd.is_null() {
         return None;
     }
     let mut buf = [0u16; 512];
     let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) } as usize;
-    let text = String::from_utf16_lossy(&buf[..n]);
+    Some(String::from_utf16_lossy(&buf[..n]))
+}
+
+fn read_status() -> Option<Status> {
+    let text = tray_status_text()?;
     let field = |k: &str| {
         text.split(';')
             .find_map(|p| p.strip_prefix(k)?.strip_prefix('='))
@@ -914,9 +919,9 @@ impl App for Settings {
         {
             self.save();
         }
-        // The tray's status changes on its own (pause, monitor switch); poll it gently.
+        // The tray's status changes on its own (pause, game, monitor); the ticker started in
+        // run() repaints once a second so this picks it up.
         self.status = read_status();
-        ctx.request_repaint_after(Duration::from_secs(1));
 
         let tx = t();
         let p = palette(ui.visuals().dark_mode, self.accent);
@@ -1258,6 +1263,24 @@ pub fn run() {
         // The window exists but has not been painted yet: placing it now means it never shows
         // up anywhere else first.
         place_window();
+        // egui_software_backend 0.0.3 redraws at once on any repaint request, ignoring the
+        // delay of request_repaint_after; calling that every frame kept the window redrawing
+        // nonstop (over a core while idle). Instead, watch the tray's status once a second
+        // and redraw only when it changed: a still window draws nothing.
+        let ticker = ctx.clone();
+        let _ = std::thread::Builder::new()
+            .name("settings ticker".into())
+            .spawn(move || {
+                let mut last = tray_status_text();
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let now = tray_status_text();
+                    if now != last {
+                        last = now;
+                        ticker.request_repaint();
+                    }
+                }
+            });
         load_fonts(&ctx);
         style(&ctx, accent);
         let image = egui::ColorImage::from_rgba_unmultiplied([64, 64], &rgba);
