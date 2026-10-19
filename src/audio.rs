@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample};
@@ -117,14 +117,21 @@ fn microphone(host: &cpal::Host, chosen: &str) -> Option<cpal::Device> {
     chosen_device.or_else(|| host.default_input_device())
 }
 
+/// How often a device that failed to open is tried again.
+const RETRY: Duration = Duration::from_secs(10);
+
 /// Keeps the capture streams open, reopening them when devices come and go (e.g. AirPods
-/// connect) or a stream loses its device.
+/// connect) or a stream loses its device. A device that fails to open (Windows can refuse it
+/// for a moment while the default device changes) is retried every 10 s on its own, without
+/// interrupting the streams that work; otherwise it would stay silent until the next change.
 pub fn spawn(mixer: Mixer) {
     thread::spawn(move || {
         let host = cpal::default_host();
         let lost = Arc::new(AtomicBool::new(false));
         let mut current = Vec::new();
         let mut streams: Vec<cpal::Stream> = Vec::new();
+        let mut failed: Vec<(cpal::Device, bool)> = Vec::new();
+        let mut retry_at = Instant::now();
         loop {
             // Disabled sources are simply not opened, so toggling one counts as a device change.
             let mut devices: Vec<(cpal::Device, bool)> = Vec::new();
@@ -146,31 +153,51 @@ pub fn spawn(mixer: Mixer) {
             let was_lost = lost.swap(false, Ordering::AcqRel);
             if ids != current || was_lost {
                 streams.clear();
+                failed.clear();
                 let mut queues = Vec::new();
-                for (dev, loopback) in &devices {
-                    let name = dev
-                        .description()
-                        .map(|d| d.name().to_string())
-                        .unwrap_or_default();
+                for (dev, loopback) in devices {
                     let q = Queue::default();
-                    match open(dev, *loopback, q.clone(), lost.clone()) {
+                    match open(&dev, loopback, q.clone(), lost.clone()) {
                         Ok(s) => {
-                            log(&format!(
-                                "audio {}: {name}",
-                                if *loopback { "system" } else { "mic" }
-                            ));
+                            log(&format!("audio {}: {}", kind(loopback), device_name(&dev)));
                             streams.push(s);
                             queues.push(q);
                         }
-                        Err(e) => log(&format!("audio open failed ({name}): {e}")),
+                        Err(e) => {
+                            log(&format!("audio open failed ({}): {e}", device_name(&dev)));
+                            failed.push((dev, loopback));
+                        }
                     }
                 }
                 *mixer.sources.lock().unwrap() = queues;
                 current = ids;
+                retry_at = Instant::now() + RETRY;
+            } else if !failed.is_empty() && Instant::now() >= retry_at {
+                failed.retain(|(dev, loopback)| {
+                    let q = Queue::default();
+                    match open(dev, *loopback, q.clone(), lost.clone()) {
+                        Ok(s) => {
+                            log(&format!(
+                                "audio {} recovered: {}",
+                                kind(*loopback),
+                                device_name(dev)
+                            ));
+                            streams.push(s);
+                            mixer.sources.lock().unwrap().push(q);
+                            false
+                        }
+                        Err(_) => true,
+                    }
+                });
+                retry_at = Instant::now() + RETRY;
             }
             thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+fn kind(loopback: bool) -> &'static str {
+    if loopback { "system" } else { "mic" }
 }
 
 fn open(

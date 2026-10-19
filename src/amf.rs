@@ -10,9 +10,10 @@
 //! entries Clipper calls are named, the rest are padding, and every index below matches the
 //! header's declaration order.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -34,7 +35,7 @@ const AMF_NEED_MORE_INPUT: i32 = 44;
 /// The SDK version these bindings were written and checked against (core/Version.h).
 const SDK_VERSION: u64 = 1 << 48 | 5 << 32 | 3 << 16;
 /// Input textures in rotation, so the encoder can work on a few frames while capture goes on.
-/// A texture is reused only once its frame's packet came out.
+/// A texture is reused only once the encoder has let go of its surface.
 const INPUTS: usize = 4;
 /// How long the encoder may go without producing a packet before it counts as stuck (a frame
 /// takes a few ms).
@@ -152,7 +153,7 @@ struct ComponentVtbl {
     init: unsafe extern "system" fn(*mut Object, i32, i32, i32) -> i32,               // 17
     _reinit: Fn0,                                                                     // 18
     terminate: unsafe extern "system" fn(*mut Object) -> i32,                         // 19
-    _drain: Fn0,                                                                      // 20
+    drain: unsafe extern "system" fn(*mut Object) -> i32,                             // 20
     _flush: Fn0,                                                                      // 21
     submit_input: unsafe extern "system" fn(*mut Object, *mut Object) -> i32,         // 22
     query_output: unsafe extern "system" fn(*mut Object, *mut *mut Object) -> i32,    // 23
@@ -161,7 +162,7 @@ struct ComponentVtbl {
 /// AMFDataVtbl / AMFBufferVtbl / AMFSurfaceVtbl prefix (core/Data.h, core/Buffer.h).
 #[repr(C)]
 struct DataVtbl {
-    _acquire: Fn0,                                          // 0
+    acquire: unsafe extern "system" fn(*mut Object) -> i32, // 0
     release: unsafe extern "system" fn(*mut Object) -> i32, // 1
     query_interface: unsafe extern "system" fn(*mut Object, *const Guid, *mut *mut Object) -> i32, // 2
     _set_property: Fn0, // 3
@@ -186,6 +187,33 @@ fn check(what: &str, result: i32) -> Result<()> {
         Ok(())
     } else {
         Err(format!("AMF {what} failed: {result}"))
+    }
+}
+
+/// One lock for every call into the AMF runtime. The capture thread submits frames while
+/// another thread finishes the previous segment's encoder and a third builds the next one, all
+/// on the same D3D11 device; the driver is not safe for that (0.2.3 crashed in SubmitInput with
+/// a null pointer inside amfrtdrv64.dll). The lock is reentrant per thread, so an encoder that
+/// fails halfway through `new` can be dropped while its builder still holds it.
+static AMF: Mutex<()> = Mutex::new(());
+thread_local!(static HOLDING: Cell<bool> = const { Cell::new(false) });
+
+struct AmfGuard(Option<MutexGuard<'static, ()>>);
+
+fn amf_lock() -> AmfGuard {
+    if HOLDING.get() {
+        return AmfGuard(None);
+    }
+    let guard = AMF.lock().unwrap_or_else(PoisonError::into_inner);
+    HOLDING.set(true);
+    AmfGuard(Some(guard))
+}
+
+impl Drop for AmfGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            HOLDING.set(false);
+        }
     }
 }
 
@@ -236,16 +264,18 @@ pub struct AmfEnc {
     in_flight: usize,
     /// When the encoder last made progress: a packet came out, or it got work while idle.
     progress: Instant,
+    /// The encoder said it has nothing more after a drain.
+    eof: bool,
     width: u32,
     height: u32,
 }
 
-// An AMF component may be used from any thread as long as calls are not concurrent; the
-// recorder serializes them behind its mutex.
+// AMF objects may be used from any thread; every call goes through `amf_lock`.
 unsafe impl Send for AmfEnc {}
 
 impl AmfEnc {
     pub fn new(gpu: &Gpu, width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
+        let _amf = amf_lock();
         let factory = factory().ok_or("no AMD encoder runtime")?;
         unsafe {
             let f = vt::<FactoryVtbl>(factory);
@@ -259,6 +289,7 @@ impl AmfEnc {
                 next: 0,
                 in_flight: 0,
                 progress: Instant::now(),
+                eof: false,
                 width,
                 height,
             };
@@ -343,6 +374,7 @@ impl AmfEnc {
 
     /// SPS and PPS with start codes, for the MP4 sample description.
     pub fn sequence_header(&self) -> Result<Vec<u8>> {
+        let _amf = amf_lock();
         unsafe {
             let e = vt::<ComponentVtbl>(self.encoder);
             let mut v = Variant::int(0);
@@ -368,14 +400,21 @@ impl AmfEnc {
     /// frames instead of stalling. An encoder that makes no progress for a second is broken:
     /// the error makes the recorder stop using it.
     pub fn encode(&mut self, gpu: &Gpu, src: &ID3D11Texture2D, time: i64) -> Result<Vec<Packet>> {
+        let _amf = amf_lock();
         let mut packets = self.collect()?;
         if self.in_flight > 0 && self.progress.elapsed() >= STUCK {
             return Err("AMF encoder produced no frame within 1 s".into());
         }
-        if self.in_flight == INPUTS {
+        // The next input whose surface the encoder no longer holds. A packet coming out does not
+        // mean the encoder released the surface; submitting one it still holds breaks the
+        // driver. With none free, this frame is dropped.
+        let Some(slot) = (0..INPUTS)
+            .map(|i| (self.next + i) % INPUTS)
+            .find(|&i| self.in_flight < INPUTS && only_ours(self.inputs[i].surface))
+        else {
             return Ok(packets);
-        }
-        let input = &self.inputs[self.next];
+        };
+        let input = &self.inputs[slot];
         copy_picture(gpu, &input.texture, 0, src, self.width, self.height);
         unsafe {
             // Submit the copy now, so the encoder does not wait for the queue to flush.
@@ -391,13 +430,14 @@ impl AmfEnc {
             self.progress = Instant::now();
         }
         self.in_flight += 1;
-        self.next = (self.next + 1) % INPUTS;
+        self.next = (slot + 1) % INPUTS;
         packets.extend(self.collect()?);
         Ok(packets)
     }
 
     /// The packets that are ready now.
     pub fn collect(&mut self) -> Result<Vec<Packet>> {
+        let _amf = amf_lock();
         let mut packets = Vec::new();
         while let Some(packet) = self.poll()? {
             self.in_flight = self.in_flight.saturating_sub(1);
@@ -407,28 +447,41 @@ impl AmfEnc {
         Ok(packets)
     }
 
-    /// Waits for the packets of every frame still in the encoder, at the end of a segment.
-    /// Low-latency usage gives one output per input, so no explicit drain is needed.
+    /// Waits for the packets of every frame still in the encoder, at the end of a segment:
+    /// Drain, then outputs until the encoder reports the end. The lock is not held while
+    /// waiting, so capture into the next segment's encoder goes on.
     pub fn drain(&mut self) -> Result<Vec<Packet>> {
-        let mut packets = self.collect()?;
-        while self.in_flight > 0 {
+        let mut packets = Vec::new();
+        if self.in_flight == 0 {
+            return Ok(packets);
+        }
+        {
+            let _amf = amf_lock();
+            let e = unsafe { vt::<ComponentVtbl>(self.encoder) };
+            check("drain", unsafe { (e.drain)(self.encoder) })?;
+            self.progress = Instant::now();
+        }
+        loop {
+            packets.extend(self.collect()?);
+            if self.in_flight == 0 || self.eof {
+                return Ok(packets);
+            }
             if self.progress.elapsed() >= STUCK {
                 return Err("AMF encoder produced no frame within 1 s".into());
             }
             // A frame takes a few milliseconds; Rust's sleep uses a high-resolution timer.
             std::thread::sleep(Duration::from_millis(1));
-            packets.extend(self.collect()?);
         }
-        Ok(packets)
     }
 
     /// One output if the encoder has one ready. A returned object is always used and released,
     /// whatever status came with it.
-    fn poll(&self) -> Result<Option<Packet>> {
+    fn poll(&mut self) -> Result<Option<Packet>> {
         unsafe {
             let e = vt::<ComponentVtbl>(self.encoder);
             let mut data = null_mut();
             let result = (e.query_output)(self.encoder, &mut data);
+            self.eof |= result == AMF_EOF;
             if data.is_null() {
                 return match result {
                     AMF_OK | AMF_REPEAT | AMF_NEED_MORE_INPUT | AMF_EOF => Ok(None),
@@ -454,6 +507,17 @@ impl AmfEnc {
     }
 }
 
+/// True when Clipper holds the only reference to `surface`: the encoder is done with it.
+fn only_ours(surface: *mut Object) -> bool {
+    unsafe {
+        let d = vt::<DataVtbl>(surface);
+        // Acquire returns the new count: ours plus this temporary one.
+        let count = (d.acquire)(surface);
+        (d.release)(surface);
+        count == 2
+    }
+}
+
 /// Copies the bytes of an AMFData that is an AMFBuffer.
 unsafe fn buffer_bytes(data: *mut Object) -> Result<Vec<u8>> {
     unsafe {
@@ -476,6 +540,7 @@ unsafe fn buffer_bytes(data: *mut Object) -> Result<Vec<u8>> {
 
 impl Drop for AmfEnc {
     fn drop(&mut self) {
+        let _amf = amf_lock();
         unsafe {
             for input in &self.inputs {
                 (vt::<DataVtbl>(input.surface).release)(input.surface);
@@ -512,8 +577,11 @@ mod tests {
         assert_eq!(at(offset_of!(ComponentVtbl, set_property)), 3);
         assert_eq!(at(offset_of!(ComponentVtbl, init)), 17);
         assert_eq!(at(offset_of!(ComponentVtbl, terminate)), 19);
+        assert_eq!(at(offset_of!(ComponentVtbl, drain)), 20);
         assert_eq!(at(offset_of!(ComponentVtbl, submit_input)), 22);
         assert_eq!(at(offset_of!(ComponentVtbl, query_output)), 23);
+        assert_eq!(at(offset_of!(DataVtbl, acquire)), 0);
+        assert_eq!(at(offset_of!(DataVtbl, release)), 1);
         assert_eq!(at(offset_of!(DataVtbl, set_pts)), 19);
         assert_eq!(at(offset_of!(DataVtbl, get_size)), 24);
         assert_eq!(at(offset_of!(DataVtbl, get_native)), 25);
@@ -521,6 +589,23 @@ mod tests {
         assert_eq!(size_of::<Variant>(), 24);
         assert_eq!(offset_of!(Variant, value), 8);
         assert_eq!(size_of::<Guid>(), 16);
+    }
+
+    /// A thread that holds the AMF lock can take it again (an encoder dropped inside `new`),
+    /// and releasing the outer guard frees it for other threads.
+    #[test]
+    fn amf_lock_is_reentrant_per_thread() {
+        let outer = amf_lock();
+        let inner = amf_lock();
+        drop(inner);
+        assert!(
+            HOLDING.get(),
+            "the inner guard must not release the outer one"
+        );
+        drop(outer);
+        assert!(!HOLDING.get());
+        let other = std::thread::spawn(|| drop(amf_lock()));
+        other.join().unwrap();
     }
 
     /// The recorder makes a new encoder for every 10 s segment; 60 of them (10 minutes of
@@ -548,5 +633,55 @@ mod tests {
             drop(enc);
             eprintln!("encoder {i}: {} packets", packets.len());
         }
+    }
+
+    /// The recorder's threads at once, sped up: capture encodes at 60 fps while another thread
+    /// builds the next encoder and a third drains and drops the previous one, every 0.2 s.
+    /// 0.2.3 crashed inside the driver after this overlap. Needs an AMD GPU:
+    /// `cargo test --release overlap -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn overlapping_encoders_do_not_crash() {
+        use std::sync::{Arc, mpsc};
+        let gpu = Arc::new(Gpu::new("AMD Radeon(TM) Graphics").unwrap());
+        let (spare_tx, spare_rx) = mpsc::sync_channel::<AmfEnc>(1);
+        let (done_tx, done_rx) = mpsc::channel::<AmfEnc>();
+        let builder = {
+            let gpu = gpu.clone();
+            std::thread::spawn(move || {
+                for _ in 0..300 {
+                    let enc = AmfEnc::new(&gpu, 1920, 1080, 60, 16_000_000).unwrap();
+                    enc.sequence_header().unwrap();
+                    if spare_tx.send(enc).is_err() {
+                        return;
+                    }
+                }
+            })
+        };
+        let finisher = std::thread::spawn(move || {
+            let mut n = 0;
+            for mut enc in done_rx {
+                enc.drain().unwrap();
+                n += 1;
+            }
+            n
+        });
+        let src = bgra_texture(&gpu, 1920, 1080).unwrap();
+        let mut enc = spare_rx.recv().unwrap();
+        let mut frame = 0i64;
+        for next in spare_rx.iter() {
+            for _ in 0..12 {
+                enc.encode(&gpu, &src, frame * 166_666).unwrap();
+                frame += 1;
+                std::thread::sleep(Duration::from_micros(16_666));
+            }
+            done_tx.send(std::mem::replace(&mut enc, next)).unwrap();
+        }
+        drop(done_tx);
+        builder.join().unwrap();
+        eprintln!(
+            "{} encoders finished, {frame} frames",
+            finisher.join().unwrap()
+        );
     }
 }

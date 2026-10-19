@@ -26,6 +26,8 @@ use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerf
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 static LOG: OnceLock<PathBuf> = OnceLock::new();
+/// The argument Windows passes when it restarts Clipper after a crash.
+const RESTARTED: &str = "--restarted";
 
 /// Appends a line to the log. A message repeated within a second is skipped, so an error that
 /// recurs every frame costs one file write a second, not sixty.
@@ -83,6 +85,19 @@ fn main() {
     let _ = LOG.set(log_path);
     // Release builds abort on panic; leave the reason in the log for bug reports.
     std::panic::set_hook(Box::new(|info| log(&format!("crash: {info}"))));
+    if args.iter().any(|a| a == RESTARTED) {
+        log("Clipper stopped unexpectedly and Windows restarted it");
+    }
+    // If Clipper ever crashes or hangs (a GPU driver fault included) after running a minute,
+    // Windows starts it again instead of leaving the user without replays. Not after updates or
+    // reboots: start with Windows already covers those.
+    let restart: Vec<u16> = RESTARTED.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        use windows_sys::Win32::System::Recovery::{
+            RESTART_NO_PATCH, RESTART_NO_REBOOT, RegisterApplicationRestart,
+        };
+        RegisterApplicationRestart(restart.as_ptr(), RESTART_NO_PATCH | RESTART_NO_REBOOT);
+    }
     capture::yield_gpu();
     app::run();
 }
