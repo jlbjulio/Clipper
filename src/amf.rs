@@ -190,11 +190,10 @@ fn check(what: &str, result: i32) -> Result<()> {
     }
 }
 
-/// One lock for every call into the AMF runtime. The capture thread submits frames while
-/// another thread finishes the previous segment's encoder and a third builds the next one, all
-/// on the same D3D11 device; the driver is not safe for that (0.2.3 crashed in SubmitInput with
-/// a null pointer inside amfrtdrv64.dll). The lock is reentrant per thread, so an encoder that
-/// fails halfway through `new` can be dropped while its builder still holds it.
+/// One lock for the calls that run while frames flow: the capture thread submitting and
+/// collecting on the current encoder, and the finisher draining the previous one, all on the
+/// same D3D11 device. Building and tearing an encoder down stay outside it, so a new segment
+/// never stalls capture. Reentrant per thread, as `encode` collects inside its own lock.
 static AMF: Mutex<()> = Mutex::new(());
 thread_local!(static HOLDING: Cell<bool> = const { Cell::new(false) });
 
@@ -264,6 +263,9 @@ pub struct AmfEnc {
     in_flight: usize,
     /// When the encoder last made progress: a packet came out, or it got work while idle.
     progress: Instant,
+    /// When a frame last went in. Frames that keep finding no free input for a second mean
+    /// the encoder holds its surfaces for good.
+    submitted: Instant,
     /// The encoder said it has nothing more after a drain.
     eof: bool,
     width: u32,
@@ -275,7 +277,6 @@ unsafe impl Send for AmfEnc {}
 
 impl AmfEnc {
     pub fn new(gpu: &Gpu, width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
-        let _amf = amf_lock();
         let factory = factory().ok_or("no AMD encoder runtime")?;
         unsafe {
             let f = vt::<FactoryVtbl>(factory);
@@ -289,6 +290,7 @@ impl AmfEnc {
                 next: 0,
                 in_flight: 0,
                 progress: Instant::now(),
+                submitted: Instant::now(),
                 eof: false,
                 width,
                 height,
@@ -374,7 +376,6 @@ impl AmfEnc {
 
     /// SPS and PPS with start codes, for the MP4 sample description.
     pub fn sequence_header(&self) -> Result<Vec<u8>> {
-        let _amf = amf_lock();
         unsafe {
             let e = vt::<ComponentVtbl>(self.encoder);
             let mut v = Variant::int(0);
@@ -412,6 +413,9 @@ impl AmfEnc {
             .map(|i| (self.next + i) % INPUTS)
             .find(|&i| self.in_flight < INPUTS && only_ours(self.inputs[i].surface))
         else {
+            if self.submitted.elapsed() >= STUCK {
+                return Err("AMF encoder kept every input for 1 s".into());
+            }
             return Ok(packets);
         };
         let input = &self.inputs[slot];
@@ -430,6 +434,7 @@ impl AmfEnc {
             self.progress = Instant::now();
         }
         self.in_flight += 1;
+        self.submitted = Instant::now();
         self.next = (slot + 1) % INPUTS;
         packets.extend(self.collect()?);
         Ok(packets)
@@ -540,7 +545,6 @@ unsafe fn buffer_bytes(data: *mut Object) -> Result<Vec<u8>> {
 
 impl Drop for AmfEnc {
     fn drop(&mut self) {
-        let _amf = amf_lock();
         unsafe {
             for input in &self.inputs {
                 (vt::<DataVtbl>(input.surface).release)(input.surface);

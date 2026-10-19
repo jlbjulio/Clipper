@@ -26,8 +26,17 @@ use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerf
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 static LOG: OnceLock<PathBuf> = OnceLock::new();
-/// The argument Windows passes when it restarts Clipper after a crash.
+/// The argument Windows passes when it restarts Clipper after a crash, followed by how many
+/// restarts in a row this is.
 const RESTARTED: &str = "--restarted";
+const MAX_RESTARTS: u32 = 3;
+
+/// How many crash restarts in a row led to this run: 0 for a normal start.
+fn restarts(args: &[String]) -> u32 {
+    args.iter().position(|a| a == RESTARTED).map_or(0, |i| {
+        args.get(i + 1).and_then(|n| n.parse().ok()).unwrap_or(1)
+    })
+}
 
 /// Appends a line to the log. A message repeated within a second is skipped, so an error that
 /// recurs every frame costs one file write a second, not sixty.
@@ -80,24 +89,50 @@ fn main() {
         return;
     }
     let log_path = dir.join("clipper.log");
-    // Keep one previous run's log for bug reports; never let it grow without bound.
-    let _ = fs::rename(&log_path, dir.join("clipper.old.log"));
+    let restarts = restarts(&args);
+    // Keep one previous run's log for bug reports; never let it grow without bound. After a
+    // crash restart the log carries on, so the crash stays in it.
+    if restarts == 0 {
+        let _ = fs::rename(&log_path, dir.join("clipper.old.log"));
+    }
     let _ = LOG.set(log_path);
     // Release builds abort on panic; leave the reason in the log for bug reports.
     std::panic::set_hook(Box::new(|info| log(&format!("crash: {info}"))));
-    if args.iter().any(|a| a == RESTARTED) {
-        log("Clipper stopped unexpectedly and Windows restarted it");
+    if restarts > 0 {
+        log(&format!(
+            "Clipper stopped unexpectedly and Windows restarted it ({restarts} in a row)"
+        ));
     }
     // If Clipper ever crashes or hangs (a GPU driver fault included) after running a minute,
-    // Windows starts it again instead of leaving the user without replays. Not after updates or
+    // Windows starts it again instead of leaving the user without replays, up to three times in
+    // a row so a fault that keeps coming back does not loop forever. Not after updates or
     // reboots: start with Windows already covers those.
-    let restart: Vec<u16> = RESTARTED.encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        use windows_sys::Win32::System::Recovery::{
-            RESTART_NO_PATCH, RESTART_NO_REBOOT, RegisterApplicationRestart,
-        };
-        RegisterApplicationRestart(restart.as_ptr(), RESTART_NO_PATCH | RESTART_NO_REBOOT);
+    if restarts < MAX_RESTARTS {
+        let restart: Vec<u16> = format!("{RESTARTED} {}", restarts + 1)
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            use windows_sys::Win32::System::Recovery::{
+                RESTART_NO_PATCH, RESTART_NO_REBOOT, RegisterApplicationRestart,
+            };
+            RegisterApplicationRestart(restart.as_ptr(), RESTART_NO_PATCH | RESTART_NO_REBOOT);
+        }
     }
     capture::yield_gpu();
     app::run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_restarts_are_counted_from_the_arguments() {
+        let args = |s: &[&str]| s.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(restarts(&args(&[])), 0);
+        assert_eq!(restarts(&args(&["--restarted"])), 1);
+        assert_eq!(restarts(&args(&["--restarted", "2"])), 2);
+        assert_eq!(restarts(&args(&["--restarted", "junk"])), 1);
+    }
 }
