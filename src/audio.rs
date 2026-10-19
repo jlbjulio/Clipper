@@ -264,16 +264,20 @@ pub fn spawn(mixer: Mixer) {
         let mut retry: HashMap<String, Instant> = HashMap::new();
         let mut running = Routers::default();
         let mut checked: Option<Instant> = None;
+        // Per-program capture that keeps failing on a supported Windows (an audio policy, a
+        // driver that refuses it) gives way to the playback devices, so clips keep their sound.
+        let mut apps_failures = 0;
         loop {
-            // Programs start and quit rarely; a process snapshot every 10 s is plenty.
-            if checked.is_none_or(|at| at.elapsed() >= RETRY) {
-                running = routers();
-                checked = Some(Instant::now());
-            }
             let mut wanted: Vec<Source> = Vec::new();
             if mixer.system.load(Ordering::Acquire) {
                 let chosen = mixer.output.lock().unwrap().clone();
-                if chosen.is_empty() && apps_ok && !running.other {
+                let apps = chosen.is_empty() && apps_ok && apps_failures < 3;
+                // Programs start and quit rarely; a process snapshot every 10 s is plenty.
+                if apps && checked.is_none_or(|at| at.elapsed() >= RETRY) {
+                    running = routers();
+                    checked = Some(Instant::now());
+                }
+                if apps && !running.other {
                     // Clipper itself plays nothing, so with Sonar its engine is the one to leave out.
                     let exclude = running.sonar.unwrap_or_else(std::process::id);
                     wanted.push(Source::Apps { exclude });
@@ -303,6 +307,9 @@ pub fn spawn(mixer: Mixer) {
                 match source.open(queue.clone(), lost.clone()) {
                     Ok(handle) => {
                         log(&format!("audio {}", source.describe()));
+                        if matches!(source, Source::Apps { .. }) {
+                            apps_failures = 0;
+                        }
                         retry.remove(&id);
                         open.push(Opened {
                             id,
@@ -315,6 +322,14 @@ pub fn spawn(mixer: Mixer) {
                         // Logged once per source; retries stay quiet until one works.
                         if !retry.contains_key(&id) {
                             log(&format!("audio open failed ({}): {e}", source.describe()));
+                        }
+                        if matches!(source, Source::Apps { .. }) {
+                            apps_failures += 1;
+                            if apps_failures == 3 {
+                                log(
+                                    "per-program audio capture keeps failing; recording playback devices",
+                                );
+                            }
                         }
                         retry.insert(id, Instant::now() + RETRY);
                     }

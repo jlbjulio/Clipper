@@ -190,10 +190,13 @@ fn check(what: &str, result: i32) -> Result<()> {
     }
 }
 
-/// One lock for the calls that run while frames flow: the capture thread submitting and
-/// collecting on the current encoder, and the finisher draining the previous one, all on the
-/// same D3D11 device. Building and tearing an encoder down stay outside it, so a new segment
-/// never stalls capture. Reentrant per thread, as `encode` collects inside its own lock.
+/// One lock for every call into the AMF runtime: the capture thread submits frames while
+/// another thread builds the next segment's encoder and the finisher drains and drops the
+/// previous one, all on the same D3D11 device. Building an encoder takes about 10 ms and
+/// dropping one 1-3 ms (measured on a Radeon 680M), under one 60 fps frame, so capture waits at
+/// most that long and the frame still goes in. Reentrant per thread: `encode` collects inside
+/// its own lock, and an encoder that fails halfway through `new` is dropped while its builder
+/// still holds it.
 static AMF: Mutex<()> = Mutex::new(());
 thread_local!(static HOLDING: Cell<bool> = const { Cell::new(false) });
 
@@ -263,9 +266,9 @@ pub struct AmfEnc {
     in_flight: usize,
     /// When the encoder last made progress: a packet came out, or it got work while idle.
     progress: Instant,
-    /// When a frame last went in. Frames that keep finding no free input for a second mean
-    /// the encoder holds its surfaces for good.
-    submitted: Instant,
+    /// Since when every frame has found all inputs still held; `None` once one went in. A
+    /// second of that means the encoder holds its surfaces for good.
+    blocked: Option<Instant>,
     /// The encoder said it has nothing more after a drain.
     eof: bool,
     width: u32,
@@ -277,6 +280,7 @@ unsafe impl Send for AmfEnc {}
 
 impl AmfEnc {
     pub fn new(gpu: &Gpu, width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
+        let _amf = amf_lock();
         let factory = factory().ok_or("no AMD encoder runtime")?;
         unsafe {
             let f = vt::<FactoryVtbl>(factory);
@@ -290,7 +294,7 @@ impl AmfEnc {
                 next: 0,
                 in_flight: 0,
                 progress: Instant::now(),
-                submitted: Instant::now(),
+                blocked: None,
                 eof: false,
                 width,
                 height,
@@ -376,6 +380,7 @@ impl AmfEnc {
 
     /// SPS and PPS with start codes, for the MP4 sample description.
     pub fn sequence_header(&self) -> Result<Vec<u8>> {
+        let _amf = amf_lock();
         unsafe {
             let e = vt::<ComponentVtbl>(self.encoder);
             let mut v = Variant::int(0);
@@ -413,7 +418,7 @@ impl AmfEnc {
             .map(|i| (self.next + i) % INPUTS)
             .find(|&i| self.in_flight < INPUTS && only_ours(self.inputs[i].surface))
         else {
-            if self.submitted.elapsed() >= STUCK {
+            if self.blocked.get_or_insert_with(Instant::now).elapsed() >= STUCK {
                 return Err("AMF encoder kept every input for 1 s".into());
             }
             return Ok(packets);
@@ -434,7 +439,7 @@ impl AmfEnc {
             self.progress = Instant::now();
         }
         self.in_flight += 1;
-        self.submitted = Instant::now();
+        self.blocked = None;
         self.next = (slot + 1) % INPUTS;
         packets.extend(self.collect()?);
         Ok(packets)
@@ -545,6 +550,7 @@ unsafe fn buffer_bytes(data: *mut Object) -> Result<Vec<u8>> {
 
 impl Drop for AmfEnc {
     fn drop(&mut self) {
+        let _amf = amf_lock();
         unsafe {
             for input in &self.inputs {
                 (vt::<DataVtbl>(input.surface).release)(input.surface);
@@ -621,8 +627,10 @@ mod tests {
         let gpu = Gpu::new("AMD Radeon(TM) Graphics").unwrap();
         let src = bgra_texture(&gpu, 1920, 1080).unwrap();
         for i in 0..60 {
+            let built = Instant::now();
             let mut enc = AmfEnc::new(&gpu, 1920, 1080, 60, 16_000_000).unwrap();
             enc.sequence_header().unwrap();
+            let built = built.elapsed();
             let mut packets = Vec::new();
             for f in 0..60 {
                 packets.extend(enc.encode(&gpu, &src, f * 166_666).unwrap());
@@ -634,8 +642,14 @@ mod tests {
             assert_eq!(packets.len(), 60);
             assert!(packets[0].keyframe);
             assert!(packets.windows(2).all(|p| p[0].time < p[1].time));
+            let dropped = Instant::now();
             drop(enc);
-            eprintln!("encoder {i}: {} packets", packets.len());
+            eprintln!(
+                "encoder {i}: {} packets, built in {:.1} ms, dropped in {:.1} ms",
+                packets.len(),
+                built.as_secs_f64() * 1000.0,
+                dropped.elapsed().as_secs_f64() * 1000.0
+            );
         }
     }
 

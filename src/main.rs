@@ -119,6 +119,22 @@ fn main() {
             RegisterApplicationRestart(restart.as_ptr(), RESTART_NO_PATCH | RESTART_NO_REBOOT);
         }
     }
+    if restarts > 0 {
+        // Ten healthy minutes end the run of crashes: the next one counts as the first again.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+            let restart: Vec<u16> = format!("{RESTARTED} 1")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            unsafe {
+                use windows_sys::Win32::System::Recovery::{
+                    RESTART_NO_PATCH, RESTART_NO_REBOOT, RegisterApplicationRestart,
+                };
+                RegisterApplicationRestart(restart.as_ptr(), RESTART_NO_PATCH | RESTART_NO_REBOOT);
+            }
+        });
+    }
     capture::yield_gpu();
     app::run();
 }
