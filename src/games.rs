@@ -139,7 +139,7 @@ pub struct Games {
     /// Per process id: its executable path (empty when unreadable) and whether it is listed
     /// as a game or installed in a library.
     exes: HashMap<u32, (String, bool)>,
-    /// Processes seen covering their monitor while in front.
+    /// Processes with a hidden path seen covering their monitor while in front.
     full_screen: HashSet<u32>,
 }
 
@@ -187,10 +187,13 @@ impl Games {
         self.exes.retain(|pid, _| alive.contains(pid));
         self.full_screen.retain(|pid| alive.contains(pid));
 
+        // Going full screen does not make a program a game: videos, slides, browsers and
+        // streaming apps do it too. Only a program whose path is hidden (anti-cheat can protect
+        // a game's process), so no list can match it, counts by covering its monitor in front.
         let fg = unsafe { GetForegroundWindow() };
         if let Some(w) = windows.iter().find(|w| w.hwnd == fg)
+            && self.exe(w.pid).0.is_empty()
             && covers_monitor(fg)
-            && !self.excluded(w.pid)
         {
             self.full_screen.insert(w.pid);
         }
@@ -236,9 +239,8 @@ impl Games {
         })
     }
 
-    /// An unreadable path (anti-cheat may protect the process) is not a reason to exclude it;
-    /// it can still count as a game by going full screen. A program the user added always
-    /// counts.
+    /// Programs that are never games, even when Windows lists them as one. A program the user
+    /// added always counts.
     fn excluded(&mut self, pid: u32) -> bool {
         let exe = self.exe(pid).0.to_lowercase();
         if self.added.contains(&exe) {
