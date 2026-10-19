@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -117,79 +117,156 @@ fn microphone(host: &cpal::Host, chosen: &str) -> Option<cpal::Device> {
     chosen_device.or_else(|| host.default_input_device())
 }
 
-/// How often a device that failed to open is tried again.
+/// How often a source that failed to open is tried again.
 const RETRY: Duration = Duration::from_secs(10);
 
-/// Keeps the capture streams open, reopening them when devices come and go (e.g. AirPods
-/// connect) or a stream loses its device. A device that fails to open (Windows can refuse it
-/// for a moment while the default device changes) is retried every 10 s on its own, without
-/// interrupting the streams that work; otherwise it would stay silent until the next change.
+/// What the audio thread records.
+enum Source {
+    /// A playback device through WASAPI loopback (`true`), or a microphone (`false`).
+    Device(cpal::Device, bool),
+    /// Every program's audio straight from Windows (per-process loopback), except the process
+    /// tree of `exclude`. Not tied to any playback device, so headphones coming and going
+    /// never interrupt it, and it opens no connection on a mixer's channels.
+    Apps { exclude: u32 },
+}
+
+impl Source {
+    /// Stable while the source is the same device, so unchanged sources stay open.
+    fn id(&self) -> String {
+        match self {
+            Source::Device(d, loopback) => format!("{}:{:?}", kind(*loopback), d.id().ok()),
+            Source::Apps { exclude } => format!("apps:{exclude}"),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Source::Device(d, loopback) => format!("{} {}", kind(*loopback), device_name(d)),
+            Source::Apps { .. } => "system: every program".to_string(),
+        }
+    }
+
+    fn open(&self, q: Queue, lost: Arc<AtomicBool>) -> Result<Handle, String> {
+        match self {
+            Source::Device(d, loopback) => open(d, *loopback, q, lost)
+                .map(Handle::Device)
+                .map_err(|e| e.to_string()),
+            Source::Apps { exclude } => apps::start(*exclude, q, lost).map(Handle::Apps),
+        }
+    }
+}
+
+/// Keeps a source recording until dropped.
+enum Handle {
+    Device(#[allow(dead_code)] cpal::Stream),
+    Apps(#[allow(dead_code)] apps::Capture),
+}
+
+/// SteelSeries Sonar's engine, which plays the processed microphone into Sonar's virtual
+/// "Microphone" output; recording it too would put the voice in clips twice.
+fn sonar_engine() -> Option<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = None;
+        let mut more = Process32FirstW(snap, &mut entry) != 0;
+        while more {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+            if String::from_utf16_lossy(&entry.szExeFile[..len])
+                .eq_ignore_ascii_case("SteelSeriesSonar.exe")
+            {
+                found = Some(entry.th32ProcessID);
+                break;
+            }
+            more = Process32NextW(snap, &mut entry) != 0;
+        }
+        CloseHandle(snap);
+        found
+    }
+}
+
+/// Keeps the capture streams open. Each source is opened and closed on its own, so a
+/// microphone change never interrupts the system audio. A source that fails to open (Windows
+/// can refuse one for a moment while the default device changes) is retried every 10 s.
 pub fn spawn(mixer: Mixer) {
     thread::spawn(move || {
         let host = cpal::default_host();
         let lost = Arc::new(AtomicBool::new(false));
-        let mut current = Vec::new();
-        let mut streams: Vec<cpal::Stream> = Vec::new();
-        let mut failed: Vec<(cpal::Device, bool)> = Vec::new();
-        let mut retry_at = Instant::now();
+        let mut open: Vec<(String, Handle, Queue)> = Vec::new();
+        let mut retry: HashMap<String, Instant> = HashMap::new();
+        // Per-process loopback needs Windows 11 (or Windows 10 build 20348); without it the
+        // playback devices are recorded as before.
+        let mut apps_unavailable = false;
         loop {
-            // Disabled sources are simply not opened, so toggling one counts as a device change.
-            let mut devices: Vec<(cpal::Device, bool)> = Vec::new();
+            let mut wanted: Vec<Source> = Vec::new();
             if mixer.system.load(Ordering::Acquire) {
                 let chosen = mixer.output.lock().unwrap().clone();
-                devices.extend(
-                    system_outputs(&host, &chosen)
-                        .into_iter()
-                        .map(|d| (d, true)),
-                );
+                if chosen.is_empty() && !apps_unavailable {
+                    let exclude = sonar_engine().unwrap_or_else(std::process::id);
+                    wanted.push(Source::Apps { exclude });
+                } else {
+                    wanted.extend(
+                        system_outputs(&host, &chosen)
+                            .into_iter()
+                            .map(|d| Source::Device(d, true)),
+                    );
+                }
             }
             if mixer.mic.load(Ordering::Acquire) {
                 let chosen = mixer.input.lock().unwrap().clone();
-                devices.extend(microphone(&host, &chosen).map(|d| (d, false)));
+                wanted.extend(microphone(&host, &chosen).map(|d| Source::Device(d, false)));
             }
-            let ids: Vec<_> = devices.iter().map(|(d, _)| d.id().ok()).collect();
-            // Read the flag every pass, so a loss that coincides with a device change does not
-            // trigger a second rebuild two seconds later.
-            let was_lost = lost.swap(false, Ordering::AcqRel);
-            if ids != current || was_lost {
-                streams.clear();
-                failed.clear();
-                let mut queues = Vec::new();
-                for (dev, loopback) in devices {
-                    let q = Queue::default();
-                    match open(&dev, loopback, q.clone(), lost.clone()) {
-                        Ok(s) => {
-                            log(&format!("audio {}: {}", kind(loopback), device_name(&dev)));
-                            streams.push(s);
-                            queues.push(q);
+            // A source lost its device: reopen everything.
+            let mut changed = false;
+            if lost.swap(false, Ordering::AcqRel) {
+                open.clear();
+                changed = true;
+            }
+            let ids: Vec<String> = wanted.iter().map(Source::id).collect();
+            let before = open.len();
+            open.retain(|(id, _, _)| ids.contains(id));
+            changed |= open.len() != before;
+            retry.retain(|id, _| ids.contains(id));
+            for (source, id) in wanted.iter().zip(ids) {
+                if open.iter().any(|(o, _, _)| *o == id)
+                    || retry.get(&id).is_some_and(|at| Instant::now() < *at)
+                {
+                    continue;
+                }
+                let q = Queue::default();
+                match source.open(q.clone(), lost.clone()) {
+                    Ok(handle) => {
+                        log(&format!("audio {}", source.describe()));
+                        retry.remove(&id);
+                        open.push((id, handle, q));
+                        changed = true;
+                    }
+                    Err(e) if matches!(source, Source::Apps { .. }) => {
+                        log(&format!(
+                            "per-program audio capture unavailable ({e}); recording playback devices"
+                        ));
+                        apps_unavailable = true;
+                    }
+                    Err(e) => {
+                        // Logged once per source; retries stay quiet until one works.
+                        if !retry.contains_key(&id) {
+                            log(&format!("audio open failed ({}): {e}", source.describe()));
                         }
-                        Err(e) => {
-                            log(&format!("audio open failed ({}): {e}", device_name(&dev)));
-                            failed.push((dev, loopback));
-                        }
+                        retry.insert(id, Instant::now() + RETRY);
                     }
                 }
-                *mixer.sources.lock().unwrap() = queues;
-                current = ids;
-                retry_at = Instant::now() + RETRY;
-            } else if !failed.is_empty() && Instant::now() >= retry_at {
-                failed.retain(|(dev, loopback)| {
-                    let q = Queue::default();
-                    match open(dev, *loopback, q.clone(), lost.clone()) {
-                        Ok(s) => {
-                            log(&format!(
-                                "audio {} recovered: {}",
-                                kind(*loopback),
-                                device_name(dev)
-                            ));
-                            streams.push(s);
-                            mixer.sources.lock().unwrap().push(q);
-                            false
-                        }
-                        Err(_) => true,
-                    }
-                });
-                retry_at = Instant::now() + RETRY;
+            }
+            if changed {
+                *mixer.sources.lock().unwrap() = open.iter().map(|(_, _, q)| q.clone()).collect();
             }
             thread::sleep(Duration::from_secs(2));
         }
@@ -295,5 +372,189 @@ impl Resampler {
         }
         self.pos -= 1.0;
         self.prev = cur;
+    }
+}
+
+/// Windows' per-process loopback: the audio every program plays, mixed by Windows itself.
+mod apps {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    use windows::Win32::Media::Audio::*;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+    use windows::core::{IUnknown, Interface, implement, w};
+
+    use super::{Queue, RATE};
+
+    /// AUDIOCLIENT_ACTIVATION_PARAMS for AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK.
+    #[repr(C)]
+    struct ActivationParams {
+        kind: i32,
+        target_pid: u32,
+        mode: i32,
+    }
+    const PROCESS_LOOPBACK: i32 = 1;
+    const EXCLUDE_TARGET_TREE: i32 = 1;
+
+    /// A PROPVARIANT holding a VT_BLOB, laid out as the Windows headers declare it.
+    #[repr(C)]
+    struct BlobVariant {
+        vt: u16,
+        reserved: [u16; 3],
+        size: u32,
+        data: *const ActivationParams,
+    }
+    const VT_BLOB: u16 = 65;
+
+    #[implement(IActivateAudioInterfaceCompletionHandler)]
+    struct Activated(mpsc::Sender<windows::core::Result<IUnknown>>);
+
+    impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
+        fn ActivateCompleted(
+            &self,
+            op: windows::core::Ref<'_, IActivateAudioInterfaceAsyncOperation>,
+        ) -> windows::core::Result<()> {
+            let result = (|| unsafe {
+                let (mut hr, mut itf) = (windows::core::HRESULT::default(), None);
+                op.ok()?.GetActivateResult(&mut hr, &mut itf)?;
+                hr.ok()?;
+                itf.ok_or_else(|| windows::core::Error::from_hresult(AUDCLNT_E_DEVICE_INVALIDATED))
+            })();
+            let _ = self.0.send(result);
+            Ok(())
+        }
+    }
+
+    /// 48 kHz stereo 16-bit; Windows converts whatever the programs play.
+    fn format() -> WAVEFORMATEX {
+        WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: 2,
+            nSamplesPerSec: RATE,
+            nAvgBytesPerSec: RATE * 4,
+            nBlockAlign: 4,
+            wBitsPerSample: 16,
+            cbSize: 0,
+        }
+    }
+
+    fn activate(exclude: u32) -> windows::core::Result<(IAudioClient, IAudioCaptureClient)> {
+        let params = ActivationParams {
+            kind: PROCESS_LOOPBACK,
+            target_pid: exclude,
+            mode: EXCLUDE_TARGET_TREE,
+        };
+        let blob = BlobVariant {
+            vt: VT_BLOB,
+            reserved: [0; 3],
+            size: size_of::<ActivationParams>() as u32,
+            data: &params,
+        };
+        let (tx, rx) = mpsc::channel();
+        let handler: IActivateAudioInterfaceCompletionHandler = Activated(tx).into();
+        unsafe {
+            ActivateAudioInterfaceAsync(
+                w!(r"VAD\Process_Loopback"),
+                &IAudioClient::IID,
+                Some(&blob as *const BlobVariant as *const PROPVARIANT),
+                &handler,
+            )?;
+            let client: IAudioClient = rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| windows::core::Error::from_hresult(AUDCLNT_E_DEVICE_INVALIDATED))??
+                .cast()?;
+            client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                2_000_000,
+                0,
+                &format(),
+                None,
+            )?;
+            let capture: IAudioCaptureClient = client.GetService()?;
+            client.Start()?;
+            Ok((client, capture))
+        }
+    }
+
+    /// The recording thread; stops and joins when dropped.
+    pub struct Capture {
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Starts recording every program except `exclude`'s process tree into `q`.
+    pub fn start(exclude: u32, q: Queue, lost: Arc<AtomicBool>) -> Result<Capture, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let quit = stop.clone();
+        let thread = thread::spawn(move || {
+            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            let (client, capture) = match activate(exclude) {
+                Ok(c) => {
+                    let _ = ready_tx.send(Ok(()));
+                    c
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e.to_string()));
+                    return;
+                }
+            };
+            while !quit.load(Ordering::Acquire) {
+                if let Err(e) = drain(&capture, &q) {
+                    crate::log(&format!("audio device lost: {e}"));
+                    lost.store(true, Ordering::Release);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = unsafe { client.Stop() };
+        });
+        ready_rx
+            .recv()
+            .map_err(|_| "capture thread ended".to_string())??;
+        Ok(Capture {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Moves every captured packet into `q` as stereo floats.
+    fn drain(capture: &IAudioCaptureClient, q: &Queue) -> windows::core::Result<()> {
+        unsafe {
+            while capture.GetNextPacketSize()? > 0 {
+                let (mut data, mut frames, mut flags) = (std::ptr::null_mut(), 0u32, 0u32);
+                capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                let mut queue = q.lock().unwrap();
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                    queue.extend(std::iter::repeat_n([0f32; 2], frames as usize));
+                } else {
+                    let pcm = std::slice::from_raw_parts(data as *const i16, frames as usize * 2);
+                    queue.extend(
+                        pcm.as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|s| [s[0] as f32 / 32768.0, s[1] as f32 / 32768.0]),
+                    );
+                }
+                let excess = queue.len().saturating_sub(RATE as usize / 5);
+                queue.drain(..excess);
+                drop(queue);
+                capture.ReleaseBuffer(frames)?;
+            }
+        }
+        Ok(())
     }
 }

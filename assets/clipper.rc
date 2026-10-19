@@ -5,8 +5,8 @@
 1 24 "clipper.manifest"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 0,2,4,0
-PRODUCTVERSION 0,2,4,0
+FILEVERSION 0,2,5,0
+PRODUCTVERSION 0,2,5,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -16,11 +16,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Clipper"
       VALUE "FileDescription", "Clipper"
-      VALUE "FileVersion", "0.2.4"
+      VALUE "FileVersion", "0.2.5"
       VALUE "InternalName", "clipper"
       VALUE "OriginalFilename", "clipper.exe"
       VALUE "ProductName", "Clipper"
-      VALUE "ProductVersion", "0.2.4"
+      VALUE "ProductVersion", "0.2.5"
     END
   END
   BLOCK "VarFileInfo"
